@@ -69,15 +69,27 @@ jobs:
           path: sources/openwrt/dl
           key: openwrt-downloads-${{ runner.os }}-${{ hashFiles('port/sources.lock.json', 'configs/feeds.conf') }}
 
-      # ==================== 更新并安装 Feeds ====================
-      # 注意顺序：必须在 DIY 之前。diy-part.sh 第 3 步要改
-      # feeds/packages/net/smartdns/Makefile 换掉 smartdns 源码，
-      # feeds 没装就找不到这个文件。
-      - name: Update & Install Feeds
+      # ==================== 更新 Feeds（只 update，绝不能 install -a）====================
+      # 顺序：必须在 DIY 之前。diy-part.sh 要改 feeds/packages/net/smartdns/Makefile，
+      # update 之后这个文件就存在了（feeds/packages/ 是 update 拉下来的源码树），
+      # 不需要 install —— install 只是在 package/feeds/ 建符号链接。
+      #
+      # ⚠ 这里原来是 install -a，这正是上次编译失败的根因：
+      #   树里此时没有 feeds.conf，scripts/feeds 会回退到 feeds.conf.default，
+      #   把 routing / telephony / video 一起装进来。其中 qt5base、weechat、
+      #   squeezelite 存在循环 Kconfig 依赖，于是：
+      #       error: recursive dependency detected!
+      #   make defconfig 直接 abort，make world 压根没跑，所以最后打包时
+      #   cp: cannot stat ...-kernel.itb —— 真实错误被埋在前面几十兆日志里。
+      #   项目自己的做法（scripts/prepare_luci_feeds.sh）是只装 .config 里列出的包，
+      #   那些有问题的包压根不会进 package/feeds，也就不会被 defconfig 扫描到。
+      - name: Update Feeds
         run: |
           cd sources/openwrt
+          # 用项目锁定的 feeds.conf（只有 packages + luci），
+          # 否则会按 feeds.conf.default 把 5 个 feed 全 clone 一遍，白花时间
+          cp ../../configs/feeds.conf feeds.conf
           ./scripts/feeds update -a
-          ./scripts/feeds install -a
 
       # ==================== 执行自定义 DIY 脚本 ====================
       - name: Run Custom DIY Script
@@ -122,8 +134,25 @@ jobs:
           # 非空 .config 就不会再覆盖它。要临时换配置才在这里填路径。
           TYFZA1_CONFIG: ${{ inputs.config_file }}
         run: |
+          # 关键：没有 pipefail 时，管道的退出码取最后一个命令 tee 的返回值（恒为 0），
+          # make world 失败也会被判成成功，一路走到打包那步才以 "cp: cannot stat
+          # ...-kernel.itb" 的形式爆出来，真实错误被埋在前面几十兆日志里。
+          set -o pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           sh port/scripts/build.sh sources/openwrt "$(nproc)" 2>&1 | tee artifacts/build.log
+      - name: 检查产物（诊断用）
+        run: |
+          cd sources/openwrt
+          echo "===== .config 里的 target / 设备 / 版本符号 ====="
+          grep -E "CONFIG_TARGET_|CONFIG_VERSION(FILENAMES|OPT|_NUMBER|CODE)?\b" .config || true
+          echo "===== bin/targets/rtl9617c/generic/ ====="
+          ls -la bin/targets/rtl9617c/generic/ 2>&1 || echo "（目录不存在）"
+          echo "===== bin 下所有 itb / squashfs / sysupgrade ====="
+          find bin -maxdepth 6 \( -name "*.itb" -o -name "*.squashfs" -o -name "*sysupgrade*" \) \
+            -printf '%p  %s bytes\n' 2>/dev/null | head -30 || echo "（一个都没有）"
+          echo "===== defconfig 后设备符号是否还在 ====="
+          grep -c "^CONFIG_TARGET_rtl9617c_generic_DEVICE_tianyi_tyfza1=y" .config ||
+            echo "设备符号已丢失 —— 这就是没有 kernel.itb 的原因"
       - name: Package sysupgrade and factory telnet installer
         run: |
           sh scripts/package_release.sh sources/openwrt artifacts/release
