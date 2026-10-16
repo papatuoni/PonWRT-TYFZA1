@@ -82,12 +82,19 @@ printf '%s\n' \
     'CONFIG_TARGET_rtl9617c=y' \
     'CONFIG_TARGET_rtl9617c_generic=y' \
     'CONFIG_TARGET_rtl9617c_generic_DEVICE_tianyi_tyfza1=y' >> "$TREE/.config"
-# 上游 boot.config 显式关掉了版本号进文件名。漏掉这行会 default y（因为
-# VERSIONOPT=y），镜像名变成 openwrt-0.3.1-alpha--rtl9617c-generic-...，
-# 中间那道多余的横线就是 IMG_PREFIX_EXTRA 在 EXTRA_IMAGE_NAME 为空时留下的。
-grep -q '^# CONFIG_VERSION_FILENAMES is not set$' "$TREE/.config" ||
-    printf '# CONFIG_VERSION_FILENAMES is not set\n' >> "$TREE/.config"
-info "已锁定 target/设备，并关闭 VERSION_FILENAMES"
+# 版本号绝不能进文件名。scripts/package_release.sh 把镜像名写死成
+#   openwrt--rtl9617c-generic-tianyi_tyfza1-kernel.itb
+# （注意 openwrt 后那道双横线：VERNUM 和 VERCODE 都为空，只剩 EXTRA 的那一道）。
+# 而这两个符号在 VERSIONOPT=y 时默认是 y，于是名字里被塞进一段版本号：
+#   CONFIG_VERSION_FILENAMES=y       -> openwrt-0.4.1-alpha--rtl9617c-generic-...
+#   CONFIG_VERSION_CODE_FILENAMES=y  -> openwrt-r0-79bc56c-rtl9617c-generic-...
+# 结果打包时 cp: cannot stat ...-kernel.itb —— 实际上镜像早就编好了，
+# 只是名字对不上。两个都必须显式关掉。
+for sym in CONFIG_VERSION_FILENAMES CONFIG_VERSION_CODE_FILENAMES; do
+    sed -i -e "/^${sym}=/d" -e "/^# ${sym} is not set$/d" "$TREE/.config"
+    printf '# %s is not set\n' "$sym" >> "$TREE/.config"
+done
+info "已锁定 target/设备，并关闭版本号进文件名（VERNUM + VERCODE）"
 
 # 强制写进 .config：先删旧行再追加，避免出现两条互相矛盾的记录
 force_pkg() {
