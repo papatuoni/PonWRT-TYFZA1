@@ -136,7 +136,10 @@ if [ "$DIY_SMARTDNS" = 1 ]; then
     # "failed to build"。git 协议三个问题一次全消，也是 ImmortalWrt-Airoha
     # 那边用的写法。整份 Makefile 重写，不 sed 官方那份（46.1 的结构与 48.x 不同）。
 
-    # 48.x 的 src/Makefile 会探测并 -latomic，46.1 那行 DEPENDS 没有，必须补
+    # DEPENDS 保持官方原样（+libpthread +libopenssl）。
+    # 别加 +libatomic：src/Makefile 里的 -latomic 只在 USE_ATOMIC 探测失败时才加，
+    # 而 aarch64 上 __atomic_* 是编译器内联的，探测必然通过；反倒是凭空加一个
+    # 树里可能不存在的 DEPENDS，会让 defconfig 直接把 smartdns 整包丢掉。
     cat > "$SD_MK" <<EOF
 include \$(TOPDIR)/rules.mk
 
@@ -166,7 +169,7 @@ define Package/smartdns
   CATEGORY:=Network
   TITLE:=smartdns server
   SUBMENU:=IP Addresses and Names
-  DEPENDS:=+libpthread +libopenssl +libatomic
+  DEPENDS:=+libpthread +libopenssl
   URL:=https://www.github.com/pymumu/smartdns/
 endef
 
@@ -203,7 +206,7 @@ EOF
 
     info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}（git 协议）"
     grep -E '^(PKG_SOURCE_PROTO|PKG_SOURCE_URL|PKG_SOURCE_VERSION|PKG_MIRROR_HASH):=' "$SD_MK" | sed 's/^/    /'
-    force_pkg smartdns luci-app-smartdns libatomic
+    force_pkg smartdns luci-app-smartdns
 fi
 
 # ------------------------------------------------------------ 4. OpenClash
