@@ -12,6 +12,12 @@ on:
         description: Optional repository path to a custom OpenWrt config
         required: false
         default: ''
+      # 新增：不填就用 diy-part.sh 里 DIY_CONFIG 指定的那份
+      #       （默认 configs/tyfza1-diy.config），想临时关掉自定义就填 0
+      diy_enable:
+        description: 'Run diy-part.sh (1=yes, 0=skip)'
+        required: false
+        default: '1'
 
 permissions:
   contents: write
@@ -63,24 +69,30 @@ jobs:
           path: sources/openwrt/dl
           key: openwrt-downloads-${{ runner.os }}-${{ hashFiles('port/sources.lock.json', 'configs/feeds.conf') }}
 
-      # ==================== 新增：执行自定义 DIY 脚本 ====================
-      - name: Run Custom DIY Script
+      # ==================== 更新并安装 Feeds ====================
+      # 注意顺序：必须在 DIY 之前。diy-part.sh 第 3 步要改
+      # feeds/packages/net/smartdns/Makefile 换掉 smartdns 源码，
+      # feeds 没装就找不到这个文件。
+      - name: Update & Install Feeds
         run: |
-          if [ -f "diy-part.sh" ]; then
+          cd sources/openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ==================== 执行自定义 DIY 脚本 ====================
+      - name: Run Custom DIY Script
+        env:
+          DIY_ENABLE: ${{ inputs.diy_enable || '1' }}
+        run: |
+          if [ "$DIY_ENABLE" != "1" ]; then
+            echo "diy_enable=$DIY_ENABLE，跳过 diy-part.sh"
+          elif [ -f "diy-part.sh" ]; then
             chmod +x diy-part.sh
             cd sources/openwrt
             ../../diy-part.sh
           else
             echo "diy-part.sh not found, skipping."
           fi
-
-      # ==================== 新增：更新并安装新添加的 Feeds ====================
-      - name: Update & Install Feeds
-        run: |
-          cd sources/openwrt
-          ./scripts/feeds update -a
-          ./scripts/feeds install -a
-      # ====================================================================
 
       - name: Obtain common runtime inputs and signing key
         env:
@@ -106,6 +118,8 @@ jobs:
         env:
           TYFZA1_RUNTIME_INPUTS: ${{ github.workspace }}/artifacts/runtime-inputs
           TYFZA1_SIGNING_KEYS: ${{ github.workspace }}/artifacts/signing
+          # 留空：.config 由 diy-part.sh 写好；sync-overlay.sh 见到
+          # 非空 .config 就不会再覆盖它。要临时换配置才在这里填路径。
           TYFZA1_CONFIG: ${{ inputs.config_file }}
         run: |
           export PATH="/usr/lib/llvm-18/bin:$PATH"
