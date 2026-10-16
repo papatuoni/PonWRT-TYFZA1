@@ -6,7 +6,7 @@
 #define NI_TID_QUEUED 0x13000
 #define NI_TIM_MASK 0x14000
 #define NI_TID_PENDING 0x18000
-/* RX owns 0x17400..0x1781f for its buffer map, spares and held NI tail. */
+/* RX owns 0x17400..0x1781f and 0x1a000..0x1ac07 for its buffer pool. */
 #define NI_PEER_NEXT 0x19000
 #define NI_PEER_PREV 0x19200
 #define NI_TID_HEAD 0x15000
@@ -121,6 +121,7 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_select(volatile u32 *ma
 			if (!*head || (!retired && ps[0] && (ps[1] == ps[2] || !((ps[3] >> 16) & BIT(tid))))) continue;
 			u32 buffer = *head, *waiting = uncached(buffer);
 			u32 id = ni_owner(mailbox, memory), frames = 1;
+			u32 tail_buffer = buffer;
 			const u32 *peer = (void *)(memory + 0xd000 + macid * 32);
 			u32 key = peer[5];
 			u32 details = macid << 8 | ((key >> 16) & 127) << 17 | BIT(15);
@@ -145,18 +146,15 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_select(volatile u32 *ma
 					ps[2] = ps[1]; mailbox[39]++;
 				} else {
 					ps[2] = ps[1];
-					u32 next = waiting[3] & ~127U, tail_id = id, body = waiting[1] + 8;
+					u32 next = waiting[3] & ~127U, body = waiting[1] + 8;
 					if (((request[2] >> 16) & 63) == 26 && !(request[3] & BIT(19))) {
-						while (next && frames < 8 && mailbox[30] + frames < 124) {
+						while (next && frames < 8) {
 							u32 *part = uncached(next), pad = (0U - body) & 3;
 							if (body + pad + part[1] + 8 > (caps >> 18)) break;
-							u32 other = ni_owner(mailbox, memory);
 							request[8 + frames * 2] = part[0]; request[9 + frames * 2] = part[1];
 							body += pad + part[1] + 8;
-							owners[other * 2] = next; owners[other * 2 + 1] = details;
-							owners[tail_id * 2 + 1] = (owners[tail_id * 2 + 1] & ~BIT(15)) | other << 24;
-							*(u32 *)(memory + NI_WAIT + other * 16 + 12) = tid;
-							tail_id = other; next = part[3] & ~127U; frames++;
+							*(u32 *)uncached(tail_buffer) = next;
+							tail_buffer = next; next = part[3] & ~127U; frames++;
 						}
 					}
 					if (frames > 1) {
@@ -166,11 +164,15 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_select(volatile u32 *ma
 					}
 				}
 			}
+			/* One WP owns the entire MPDU. Its BIDs use the untouched first
+			 * word of headroom; the in-place WLAN header starts after it. */
+			*(u32 *)uncached(tail_buffer) = 0;
 			*head = waiting[3] & ~127U;
 			mailbox[112] = (tid + 1) & 7;
 			if (!*head) *(u32 *)(memory + NI_TID_TAIL + (macid * 8 + tid) * 4) = 0;
 			u32 *queued = (void *)(memory + NI_PEER_QUEUED + macid * 4);
-			*queued -= frames; mailbox[38] -= frames; mailbox[30] += frames;
+			/* Admission counts WPs, not the number of gathered MSDUs. */
+			*queued -= frames; mailbox[38] -= frames; mailbox[30]++;
 			(*(u32 *)(memory + NI_TID_QUEUED + (macid * 8 + tid) * 4)) -= frames;
 			mailbox[170] = next_peer[macid];
 			if (!*queued) {
@@ -181,6 +183,7 @@ static u32 __attribute__((section(".rxq"), noinline)) ni_select(volatile u32 *ma
 				}
 			}
 			ni_peer_event(mailbox, memory, macid);
+			if (retired && mailbox[78]) pe_event(mailbox);
 			if (!retired) {
 				(*(u32 *)(memory + 0x17000 + macid * 4)) += frames;
 				(*(u32 *)(memory + 0x17200 + macid * 4)) |= BIT(tid);

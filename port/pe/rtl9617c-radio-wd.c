@@ -7,6 +7,7 @@ struct packed_word { u32 value; } __attribute__((packed));
 #define BIT(n) (1U << (n))
 #define REQUEST_BASE 0x4000
 #define MAILBOX_OFFSET 0x2000
+#include "rx-geometry.h"
 
 static inline void sync(void) { __asm__ volatile("sync" ::: "memory"); }
 static inline void *uncached(u32 address) { return (void *)(address | 0xa0000000U); }
@@ -20,11 +21,13 @@ static void unaligned_word(u8 *out, u32 value)
 	((struct packed_word *)out)->value = value;
 }
 
+#ifdef PE_UPLINK
 static u32 mac_equal(const u8 *a, const u8 *b)
 {
 	return ((const struct packed_word *)a)->value == ((const struct packed_word *)b)->value &&
 		a[4] == b[4] && a[5] == b[5];
 }
+#endif
 
 static void address(u8 *out, u32 dma, u32 bytes, u32 last)
 {
@@ -103,21 +106,37 @@ static void pe_rpq(volatile u32 *mailbox, u8 *memory)
 	if (!mailbox[68]) return;
 	volatile u32 *bar = (void *)mailbox[2];
 	u32 consumer = mailbox[70], producer = mailbox[73];
-	if (((bar[0x121c / 4] >> 16) & 1023) == consumer ||
-	    ((producer + 1) & 255) == mailbox[74]) return;
-	volatile u32 *buffer = uncached(mailbox[68] + consumer * 512);
+	if (((bar[0x121c / 4] >> 16) & 1023) == consumer) return;
+	volatile u32 *buffer = uncached(mailbox[68] + consumer * RTL_AX_RPQ_BUFFER_BYTES);
 	u32 info = buffer[0], tag = mailbox[71] == 8191 ? 1 : mailbox[71] + 1;
 	if (((info >> 16) & 8191) != tag) return;
 	sync();
 	u32 wd = buffer[1], type = (wd >> 24) & 15, bytes = wd & 0x3fff;
 	u32 offset = 4 + (wd & BIT(31) ? 32 : 16) + ((wd >> 14) & 3) * 2 + ((wd >> 28) & 7) * 16;
 	if ((wd & BIT(23)) && type != 1) offset += 4;
-	u32 written = info & 0x3fff, forwarded = 0;
-	u8 *out = uncached(mailbox[72] + producer * 512);
-	if ((info & 0xc000) != 0xc000 || written > 512 || offset > written || bytes > written - offset) {
+	u32 written = info & 0x3fff, forwarded = 0, completed = mailbox[75];
+	u32 old = rtl_ax_rx_epoch_old(&mailbox[RTL_AX_PE_DFS_EPOCH + 1], consumer);
+	u8 *out = uncached(mailbox[72] + producer * RTL_AX_RPQ_BUFFER_BYTES);
+	if ((info & 0xc000) != 0xc000 || written > RTL_AX_RPQ_BUFFER_BYTES || offset > written || bytes > written - offset) {
 		mailbox[77]++;
 	} else {
-		if (type != 7) { header_copy(out, (const u8 *)buffer, written); forwarded = bytes; }
+		/* Stock dispatch recycles WPs separately from ordinary RX delivery.
+		 * Reserve ARM space only for reports that actually need it. Check
+		 * the whole packet before completing any WP in a mixed report. */
+		if (((producer + 1) & 255) == mailbox[74] && !(type == 8 && old)) {
+			if (type != 7) return;
+			for (u32 i = 0; i + 4 <= bytes; i += 4) {
+				u32 report = ((const struct packed_word *)((u8 *)buffer + offset + i))->value;
+				u32 id = (report >> 16) & 4095;
+				if (id < 256 || id >= 384) return;
+				volatile u32 *owner = (void *)(memory + 0xc400 + (id - 256) * 8);
+				u32 details = owner[1];
+				if (owner[0] && !(details & BIT(31)) &&
+				    ((details >> 8) & 127) == (report & 127) && (details & BIT(16))) return;
+			}
+		}
+		if (type == 8 && old) { /* Old channel's radar report. */ }
+		else if (type != 7) { header_copy(out, (const u8 *)buffer, written); forwarded = bytes; }
 		else for (u32 i = 0; i + 4 <= bytes; i += 4) {
 			u32 report = ((const struct packed_word *)((u8 *)buffer + offset + i))->value;
 			u32 id = (report >> 16) & 4095, status = (report >> 13) & 7;
@@ -134,14 +153,9 @@ static void pe_rpq(volatile u32 *mailbox, u8 *memory)
 				if (!forwarded) header_copy(out, (const u8 *)buffer, offset);
 				unaligned_word(out + offset + forwarded, report); forwarded += 4;
 			}
-			for (;;) {
-				details = owners[member * 2 + 1];
-				owners[member * 2 + 1] = details | BIT(31) | status;
-				*(u32 *)(memory + 0xc800 + mailbox[45] * 4) = member;
-				mailbox[45] = (mailbox[45] + 1) & 127;
-				if (details & BIT(15)) break;
-				member = (details >> 24) & 127;
-			}
+			owners[member * 2 + 1] = details | BIT(31) | status;
+			*(u32 *)(memory + 0xc800 + mailbox[45] * 4) = member;
+			mailbox[45] = (mailbox[45] + 1) & 127;
 			mailbox[75]++; mailbox[76] += !!(status || (report & BIT(31)));
 		}
 		if (forwarded) {
@@ -156,7 +170,9 @@ static void pe_rpq(volatile u32 *mailbox, u8 *memory)
 	mailbox[71] = tag;
 	sync();
 	*(volatile u16 *)((u8 *)bar + 0x121c) = mailbox[70];
-	bar[0x10b4 / 4] = BIT(2) | BIT(20);
+	bar[0x10b4 / 4] = BIT(2);
+	/* A peer/key waiter needs its completion even while other peers keep TX busy. */
+	if (mailbox[78] && mailbox[75] != completed) pe_event(mailbox);
 }
 
 #ifdef PE_UPLINK
@@ -204,7 +220,9 @@ static void ni_recycle(volatile u32 *mailbox, u8 *memory)
 		if (!(ni[(0x6328 + mailbox[117] * 4) / 4] & 0x3fff) ||
 		    !(ni[mailbox[116] / 4] & BIT(31))) return;
 		sync();
-		ni[mailbox[116] / 4 + 1] = owners[id * 2] | mailbox[117];
+		u32 buffer = owners[id * 2];
+		u32 next = *(u32 *)uncached(buffer);
+		ni[mailbox[116] / 4 + 1] = buffer | mailbox[117];
 #ifdef PE_UPLINK
 		u32 macid = (owners[id * 2 + 1] >> 8) & 127;
 		if (macid) {
@@ -213,8 +231,11 @@ static void ni_recycle(volatile u32 *mailbox, u8 *memory)
 			ni_peer_event(mailbox, memory, macid);
 		}
 #endif
-		owners[id * 2 + 1] = owners[id * 2] = 0;
-		mailbox[29]++; mailbox[30]--;
+		owners[id * 2] = next;
+		mailbox[29]++;
+		if (next) continue;
+		owners[id * 2 + 1] = 0;
+		mailbox[30]--;
 		if (dropped) mailbox[47] = 0;
 		else mailbox[46] = (consumer + 1) & 127;
 	}
@@ -260,18 +281,22 @@ void pe_main(volatile u32 *control)
 		volatile u32 *ni = (void *)0xb0000000;
 		volatile u32 *owners = (void *)(memory + 0xc400);
 #endif
+		if (!(command & 1)) {
+			/* ARM may release the event timer as soon as pause is acknowledged. */
+			sync();
+			mailbox[4] = command;
+			continue;
+		}
 		mailbox[4] = command;
 		pe_event_flush(mailbox);
-		if (!(command & 1)) continue;
 		pe_rpq(mailbox, memory);
 		/* Drain a short RX burst before servicing downlink and RPQ again. */
 		for (u32 budget = 0; budget < 16; budget++) {
-			u32 before = mailbox[81];
+			u32 before = mailbox[81] | mailbox[RTL_AX_RX_WORK_PROCESS] << 8;
 			pe_rxq(mailbox);
-			if (mailbox[81] == before || mailbox[94] != mailbox[95]) break;
+			if ((mailbox[81] | mailbox[RTL_AX_RX_WORK_PROCESS] << 8) == before) break;
 		}
 		if (mailbox[30]) ni_recycle(mailbox, memory);
-		if (mailbox[78] && !mailbox[30]) { mailbox[78] = 0; pe_event(mailbox); }
 		sync();
 		const u32 *request = (void *)(memory + REQUEST_BASE + consumer * 128);
 		if (consumer == mailbox[8]) {
@@ -302,12 +327,14 @@ void pe_main(volatile u32 *control)
 			if (retired || (entry[0] & 0x50) != 0x50 || length < 14 || length > 2048 - 32 - header) {
 				owners[id * 2] = ni_buffer;
 				owners[id * 2 + 1] = BIT(31);
+				*(u32 *)uncached(ni_buffer) = 0;
 				mailbox[47] = id + 1;
 				mailbox[30]++;
 				if (retired) mailbox[63]++;
 				else mailbox[40]++;
 				mailbox[26] = (mailbox[26] + 8) & 1023;
 				sync(); ni[0x7160 / 4] = mailbox[26];
+				if (mailbox[78]) pe_event(mailbox);
 				continue;
 			}
 			const u32 *peer = (void *)(memory + 0xd000 + mailbox[27] * 32);
@@ -334,7 +361,8 @@ void pe_main(volatile u32 *control)
 			owners[id * 2] = ni_buffer;
 			owners[id * 2 + 1] = (asleep ? BIT(16) : 0) | mailbox[27] << 8 |
 				((ni_request[5] >> 16) & 127) << 17 | BIT(15);
-			if (!asleep && queued > 1 && mailbox[30] < 123 &&
+			*(u32 *)uncached(ni_buffer) = 0;
+			if (!asleep && queued > 1 &&
 			    ((ni_request[2] >> 16) & 63) == 26 && !(ni_request[3] & BIT(19))) {
 				const u32 *second = uncached(mailbox[25] + ((mailbox[26] + 8) & 1023));
 				u32 buffer2 = second[0] & 0xffffff80, head2;
@@ -342,16 +370,13 @@ void pe_main(volatile u32 *control)
 				u32 pad = (0U - length - 8) & 3;
 				if ((second[0] & 0x50) == 0x50 && bytes2 >= 14 && bytes2 <= 2048 - 32 - head2 &&
 				    length + bytes2 + 16 + pad <= (caps >> 18)) {
-					u32 other = (id + 1) & 127;
-					while (owners[other * 2]) other = (other + 1) & 127;
 					ni_request[4] |= BIT(21);
 					ni_request[2] = BIT(25) | 26U << 16 | (26 + length + bytes2 + 16 + pad);
 					ni_request[10] = buffer2 + 32 + head2;
 					ni_request[11] = bytes2;
-					owners[other * 2] = buffer2;
-					owners[other * 2 + 1] = owners[id * 2 + 1];
-					owners[id * 2 + 1] = (owners[id * 2 + 1] & ~BIT(15)) | other << 24;
-					mailbox[30]++; ni_frames = 2;
+					*(u32 *)uncached(ni_buffer) = buffer2;
+					*(u32 *)uncached(buffer2) = 0;
+					ni_frames = 2;
 				}
 			}
 			mailbox[30]++;

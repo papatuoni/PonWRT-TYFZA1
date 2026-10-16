@@ -22,6 +22,25 @@
 #define EPON_STATUS 0x0010
 #define MPCP_REGISTERED 0x2014
 
+int rtl_pon_stop_locked(struct rtl9617c_pon *pon)
+{
+	int ret;
+
+	lockdep_assert_held(&pon->control_lock);
+	if (rtl_pon_mode_is_epon(pon->mode)) {
+		ret = rtl_pon_epon_traffic_locked(pon, false);
+		rtl_pon_mpcp_stop_locked(pon);
+	} else {
+		gpiod_set_value_cansleep(pon->tx_disable, 1);
+		ret = pon->fe_enabled ? rtl_pon_fe_configure_locked(pon, false) : 0;
+		if (pon->mode == RTL_PON_GPON)
+			rtl_pon_gpon_stop_locked(pon);
+		else
+			rtl_pon_xgpon_stop_locked(pon);
+	}
+	return ret;
+}
+
 int rtl_pon_serdes_configure(struct rtl9617c_pon *pon, enum rtl_pon_mode mode)
 {
 	int ret;
@@ -47,16 +66,24 @@ int rtl_pon_epon_traffic(struct rtl9617c_pon *pon, bool enable)
 	int ret;
 
 	mutex_lock(&pon->control_lock);
-	ret = rtl_pon_epon_traffic_locked(pon, enable);
+	ret = rtl_pon_mode_is_epon(pon->mode) ?
+		rtl_pon_epon_traffic_locked(pon, enable) : -EOPNOTSUPP;
 	mutex_unlock(&pon->control_lock);
 	return ret;
 }
 
-void rtl_pon_mpcp_stop(struct rtl9617c_pon *pon)
+int rtl_pon_mpcp_stop(struct rtl9617c_pon *pon)
 {
+	int ret = 0;
+
 	mutex_lock(&pon->control_lock);
-	rtl_pon_mpcp_stop_locked(pon);
+	if (rtl_pon_mode_is_epon(pon->mode)) {
+		ret = pon->fe_enabled ? rtl_pon_fe_configure_locked(pon, false) : 0;
+		rtl_pon_mpcp_stop_locked(pon);
+	} else
+		ret = -EOPNOTSUPP;
 	mutex_unlock(&pon->control_lock);
+	return ret;
 }
 
 int rtl_pon_mpcp_configure(struct rtl9617c_pon *pon)
@@ -74,7 +101,8 @@ int rtl_pon_pdc_configure(struct rtl9617c_pon *pon)
 	int ret;
 
 	mutex_lock(&pon->control_lock);
-	ret = rtl_pon_pdc_configure_locked(pon);
+	ret = pon->gpon_drain.phase || pon->xgpon_recovery_phase ? -EBUSY :
+		rtl_pon_pdc_configure_locked(pon);
 	mutex_unlock(&pon->control_lock);
 	return ret;
 }
@@ -84,7 +112,8 @@ int rtl_pon_puc_configure(struct rtl9617c_pon *pon)
 	int ret;
 
 	mutex_lock(&pon->control_lock);
-	ret = rtl_pon_puc_configure_locked(pon);
+	ret = pon->gpon_drain.phase || pon->xgpon_recovery_phase ? -EBUSY :
+		rtl_pon_puc_configure_locked(pon);
 	mutex_unlock(&pon->control_lock);
 	return ret;
 }
@@ -127,11 +156,9 @@ static ssize_t bosa_store(struct device *dev, struct device_attribute *attr,
 	if (!prepare)
 		return -EINVAL;
 	mutex_lock(&pon->control_lock);
-	rtl_pon_gpon_stop_locked(pon);
-	rtl_pon_xgpon_stop_locked(pon);
-	rtl_pon_epon_traffic_locked(pon, false);
-	rtl_pon_mpcp_stop_locked(pon);
-	ret = rtl9617c_bosa_prepare(pon->bosa_dev);
+	ret = rtl_pon_stop_locked(pon);
+	if (!ret)
+		ret = rtl9617c_bosa_prepare(pon->bosa_dev);
 	mutex_unlock(&pon->control_lock);
 	return ret ? ret : count;
 }
@@ -180,10 +207,12 @@ static ssize_t optical_show(struct device *dev, struct device_attribute *attr, c
 {
 	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
 	u32 status = readl(pon->optical_status);
-	return sysfs_emit(buf, "control=%08x status=%08x rx_los=%u module_absent=%u tx_signal_detect=%u tx_fault=%u tx_disabled=%u irq_count=%u last_irq=%08x\n",
+	return sysfs_emit(buf, "control=%08x status=%08x rx_los=%u module_absent=%u tx_signal_detect=%u tx_fault=%u tx_disabled=%u irq_count=%u last_irq=%08x xgpon_rogue_at0=%u xgpon_rogue_at1=%u xgpon_rogue_pending=%u\n",
 		readl(pon->optical_control), status, !!(status & BIT(3)), !!(status & BIT(2)),
 		!!(status & BIT(1)), !!(status & BIT(0)), gpiod_get_value_cansleep(pon->tx_disable),
-		pon->optical_irq_count, pon->last_optical_irq);
+		pon->optical_irq_count, pon->last_optical_irq,
+		READ_ONCE(pon->xgpon_rogue_count[0]), READ_ONCE(pon->xgpon_rogue_count[1]),
+		READ_ONCE(pon->xgpon_rogue_pending));
 }
 static DEVICE_ATTR_RO(optical);
 
@@ -225,22 +254,29 @@ static ssize_t activation_show(struct device *dev, struct device_attribute *attr
 	ssize_t size;
 
 	mutex_lock(&pon->lock);
+	if (rtl_pon_mode_is_epon(pon->mode)) {
+		mutex_unlock(&pon->lock);
+		return -EOPNOTSUPP;
+	}
 	if (pon->mode == RTL_PON_XGPON || pon->mode == RTL_PON_XGSPON) {
-		size = sysfs_emit(buf, "enabled=%u omcc=%u omcc_onu_id=%u omcc_gem=%u error=%d irq_count=%llu last_irq=%08x key_ready=%u key_state=%u active_key=%u key_reports=%llu tk4=%llu tk5=%llu recovering=%u last_events=%08x deactivations=%llu\n",
+		size = sysfs_emit(buf, "enabled=%u omcc=%u omcc_onu_id=%u omcc_gem=%u error=%d irq_count=%llu last_irq=%08x key_ready=%u key_state=%u active_key=%u key_reports=%llu tk4=%llu tk5=%llu recovering=%u last_events=%08x deactivations=%llu mac_resets=%llu reset_reason=%u health_matches=%u restore_pending=%u dying_gasp_ready=%u dying_gasp_tx=%llu dying_gasp_error=%d\n",
 			pon->xgpon_enabled, pon->xgpon_omcc_ready, pon->xgpon_omcc_id,
 			pon->xgpon_omcc_id, pon->xgpon_activation_error, pon->xgpon_irq_count,
 			pon->xgpon_last_irq, pon->xgpon_key_ready, pon->xgpon_key_state,
 			pon->xgpon_active_key + 1, pon->xgpon_key_reports, pon->xgpon_key_tk4,
 			pon->xgpon_key_tk5, pon->xgpon_recover, pon->xgpon_last_transitions,
-			pon->xgpon_deactivations);
+			pon->xgpon_deactivations, pon->xgpon_mac_resets, pon->xgpon_reset_reason,
+			pon->xgpon_health_matches, pon->xgpon_restore_pending,
+			!!READ_ONCE(pon->dying_gasp_packet), READ_ONCE(pon->dying_gasp_tx),
+			READ_ONCE(pon->dying_gasp_error));
 		mutex_unlock(&pon->lock);
 		return size;
 	}
 	size = sysfs_emit(buf,
-		"enabled=%u omcc=%u omcc_onu_id=%u omcc_gem=%u ds_fec=%u error=%d irq_count=%llu last_irq=%08x key_switches=%llu\n",
+		"enabled=%u omcc=%u omcc_onu_id=%u omcc_gem=%u ds_fec=%u error=%d irq_count=%llu last_irq=%08x key_switches=%llu recovering=%u\n",
 		pon->gpon_enabled, pon->gpon_omcc_ready, pon->gpon_omcc_onu_id,
 		pon->gpon_omcc_gem, pon->gpon_ds_fec, pon->gpon_activation_error,
-		pon->gpon_irq_count, pon->gpon_last_irq, pon->gpon_key_switches);
+		pon->gpon_irq_count, pon->gpon_last_irq, pon->gpon_key_switches, pon->gpon_recover);
 	mutex_unlock(&pon->lock);
 	return size;
 }
@@ -255,8 +291,11 @@ static ssize_t activation_store(struct device *dev, struct device_attribute *att
 	if (ret)
 		return ret;
 	mutex_lock(&pon->control_lock);
-	ret = pon->mode == RTL_PON_GPON ? rtl_pon_gpon_activation_locked(pon, enable) :
-		rtl_pon_xgpon_activation_locked(pon, enable);
+	if (rtl_pon_mode_is_epon(pon->mode))
+		ret = -EOPNOTSUPP;
+	else
+		ret = pon->mode == RTL_PON_GPON ? rtl_pon_gpon_activation_locked(pon, enable) :
+			rtl_pon_xgpon_activation_locked(pon, enable);
 	mutex_unlock(&pon->control_lock);
 	return ret ? ret : count;
 }
@@ -351,6 +390,8 @@ static DEVICE_ATTR_RW(onu_mac);
 static ssize_t llid_count_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
+	if (!rtl_pon_mode_is_epon(READ_ONCE(pon->mode)))
+		return -EOPNOTSUPP;
 	return sysfs_emit(buf, "%u\n", pon->llid_count);
 }
 
@@ -366,6 +407,11 @@ static ssize_t llid_count_store(struct device *dev, struct device_attribute *att
 		return -EINVAL;
 	mutex_lock(&pon->control_lock);
 	mutex_lock(&pon->lock);
+	if (!rtl_pon_mode_is_epon(pon->mode)) {
+		mutex_unlock(&pon->lock);
+		mutex_unlock(&pon->control_lock);
+		return -EOPNOTSUPP;
+	}
 	if (pon->mpcp_enabled) {
 		mutex_unlock(&pon->lock);
 		mutex_unlock(&pon->control_lock);
@@ -387,7 +433,7 @@ static ssize_t mpcp_show(struct device *dev, struct device_attribute *attr, char
 	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
 	ssize_t size;
 	mutex_lock(&pon->lock);
-	size = rtl_pon_mpcp_state(pon, buf);
+	size = rtl_pon_mode_is_epon(pon->mode) ? rtl_pon_mpcp_state(pon, buf) : -EOPNOTSUPP;
 	mutex_unlock(&pon->lock);
 	return size;
 }
@@ -403,7 +449,7 @@ static ssize_t mpcp_store(struct device *dev, struct device_attribute *attr,
 	if (enabled)
 		ret = rtl_pon_mpcp_configure(pon);
 	else
-		rtl_pon_mpcp_stop(pon);
+		ret = rtl_pon_mpcp_stop(pon);
 	return ret ? ret : count;
 }
 static DEVICE_ATTR_RW(mpcp);
@@ -413,7 +459,7 @@ static ssize_t llid_table_show(struct device *dev, struct device_attribute *attr
 	struct rtl9617c_pon *pon = dev_get_drvdata(dev);
 	ssize_t size;
 	mutex_lock(&pon->lock);
-	size = rtl_pon_llid_table(pon, buf);
+	size = rtl_pon_mode_is_epon(pon->mode) ? rtl_pon_llid_table(pon, buf) : -EOPNOTSUPP;
 	mutex_unlock(&pon->lock);
 	return size;
 }
@@ -437,7 +483,8 @@ static ssize_t llid_table_store(struct device *dev, struct device_attribute *att
 		return -EINVAL;
 	mutex_lock(&pon->control_lock);
 	mutex_lock(&pon->lock);
-	ret = rtl_pon_llid_update(pon, add, index, mac, llid, multicast);
+	ret = rtl_pon_mode_is_epon(pon->mode) ?
+		rtl_pon_llid_update(pon, add, index, mac, llid, multicast) : -EOPNOTSUPP;
 	if (!ret)
 		ret = rtl_pon_pdc_refresh(pon);
 	mutex_unlock(&pon->lock);
@@ -503,6 +550,8 @@ static ssize_t traffic_show(struct device *dev, struct device_attribute *attr, c
 	unsigned long received = 0, transmitted = 0, receive_drops = 0, transmit_drops = 0;
 	unsigned int i;
 
+	if (!rtl_pon_mode_is_epon(READ_ONCE(pon->mode)))
+		return -EOPNOTSUPP;
 	rcu_read_lock();
 	for (i = 0; i < 32; i++) {
 		struct net_device *port = rcu_dereference(pon->oam_devices[i]);
@@ -637,6 +686,10 @@ static ssize_t active_serial_number_show(struct device *dev, struct device_attri
 	ssize_t length;
 
 	mutex_lock(&pon->lock);
+	if (rtl_pon_mode_is_epon(pon->mode)) {
+		mutex_unlock(&pon->lock);
+		return -EOPNOTSUPP;
+	}
 	serial = pon->mode == RTL_PON_GPON ? pon->gpon_serial : pon->xgpon_serial;
 	length = sysfs_emit(buf, "%*phN\n", 8, serial);
 	mutex_unlock(&pon->lock);
@@ -796,8 +849,15 @@ static int rtl9617c_pon_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 	ret = rtl_pon_omci_init(pon);
-	if (ret)
+	if (ret) {
 		rtl_pon_oam_remove(pon);
+		return ret;
+	}
+	ret = rtl_pon_dying_gasp_init(pon, pdev);
+	if (ret) {
+		rtl_pon_omci_remove(pon);
+		rtl_pon_oam_remove(pon);
+	}
 	return ret;
 }
 
@@ -807,12 +867,9 @@ static void rtl9617c_pon_shutdown(struct platform_device *pdev)
 	int ret;
 
 	mutex_lock(&pon->control_lock);
-	rtl_pon_gpon_stop_locked(pon);
-	rtl_pon_xgpon_stop_locked(pon);
-	ret = rtl_pon_epon_traffic_locked(pon, false);
+	ret = rtl_pon_stop_locked(pon);
 	if (ret)
 		dev_err(pon->dev, "PON forwarding cleanup failed during shutdown: %d\n", ret);
-	rtl_pon_mpcp_stop_locked(pon);
 	writel(0, pon->top_irq + 4);
 	writel(0, pon->optical_irq + 4);
 	synchronize_irq(pon->mpcp_irq);

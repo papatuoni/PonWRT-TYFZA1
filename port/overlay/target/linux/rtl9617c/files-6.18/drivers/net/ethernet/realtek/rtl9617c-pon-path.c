@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* ITU business configuration follows original ca_gpon_port_{tcont_set,gem_port_add}. */
+#include <linux/delay.h>
 #include <linux/etherdevice.h>
 #include <linux/if_vlan.h>
 #include <linux/io.h>
@@ -28,9 +29,14 @@ static int path_access(void *context, unsigned int address, unsigned int value)
 {
 	struct rtl9617c_pon *pon = context;
 	u32 status;
+	int ret;
 
 	writel(value, pon->mac + address);
-	return readl_poll_timeout(pon->mac + address, status, !(status & BIT(31)), 1, 100000);
+	ret = readl_poll_timeout(pon->mac + address, status, !(status & BIT(31)), 1, 100000);
+	if (ret)
+		dev_err(pon->dev, "ITU table timeout reg=%04x command=%08x status=%08x\n",
+			address, value, status);
+	return ret;
 }
 
 void rtl_pon_itu_carrier(struct rtl9617c_pon *pon)
@@ -40,7 +46,7 @@ void rtl_pon_itu_carrier(struct rtl9617c_pon *pon)
 	rcu_read_lock();
 	dev = rcu_dereference(pon->data_devices[0]);
 	if (dev) {
-		if (pon->itu_paths_ready && netif_carrier_ok(pon->omci_device))
+		if (pon->itu_paths_ready && netif_carrier_ok(pon->omci_device) && !pon->xgpon_restore_pending)
 			netif_carrier_on(dev);
 		else
 			netif_carrier_off(dev);
@@ -48,44 +54,47 @@ void rtl_pon_itu_carrier(struct rtl9617c_pon *pon)
 	rcu_read_unlock();
 }
 
-void rtl_pon_itu_paths_invalidate(struct rtl9617c_pon *pon)
+int rtl_pon_itu_paths_invalidate(struct rtl9617c_pon *pon, enum rtl_pon_mode mode)
 {
+	static const struct rtl_itu_paths empty;
 	struct net_device *dev = rcu_access_pointer(pon->data_devices[0]);
+	int ret = 0;
 
 	lockdep_assert_held(&pon->lock);
 	pon->itu_paths_ready = false;
 	pon->itu_path_epoch++;
 	if (dev) {
 		netif_carrier_off(dev);
-		pon->itu_paths_error = rtl9617c_ni_itu_paths(pon->ni_dev, dev, NULL);
+		ret = rtl9617c_ni_itu_paths(pon->ni_dev, dev,
+			rtl_pon_mode_is_epon(mode) ? NULL : &empty);
+		pon->itu_paths_error = ret;
 	}
+	return ret;
 }
 
 static int path_program(struct rtl9617c_pon *pon, const struct rtl_itu_paths *paths)
 {
 	const struct rtl_dq_io io = {pon, path_read, path_write, path_access};
-	u32 queues[8] = {255}, active = 0;
+	u32 queues[8] = {255}, active = 0, alloc[32] = {};
 	unsigned int i, index;
 	bool gpon = pon->mode == RTL_PON_GPON;
 	int ret;
 
 	for (index = 1; index < 32; index++) {
-		ret = rtl_itu_puc_tcont(&io, index, 0);
+		ret = rtl_itu_puc_schedule(&io, index, 0, (const u8[8]){});
 		if (ret) return ret;
 		if (gpon) {
 			if (!(pon->itu_alloc_valid & BIT(index))) continue;
 			ret = rtl_gpon_tcont_set(&io, pon->itu_alloc_ids[index], 0, false, false, true);
 			if (ret) return ret;
 			pon->itu_alloc_valid &= ~BIT(index);
-		} else {
-			u32 status;
-
-			/* Original T-CONT removal flushes USBG before releasing Alloc-ID. */
-			rtl_pon_update(pon->mac + 0x4004, GENMASK(28, 24) | GENMASK(11, 8) | BIT(31),
-				(index << 24) | BIT(31));
-			ret = readl_poll_timeout(pon->mac + 0x4004, status, !(status & BIT(31)), 1, 100000);
-			if (ret) return ret;
-			ret = rtl_xgpon_tcont_set(&io, index, RTL_XGPON_ALLOC_ID_INVALID, false, false);
+		}
+	}
+	if (!gpon) {
+		/* All business queues are stopped; one stock burst interval covers them. */
+		usleep_range(1000, 1100);
+		for (index = 1; index < 32; index++) {
+			ret = rtl_xgpon_tcont_release(&io, index);
 			if (ret) return ret;
 		}
 	}
@@ -119,10 +128,11 @@ static int path_program(struct rtl9617c_pon *pon, const struct rtl_itu_paths *pa
 				ret = rtl_xgpon_tcont_set(&io, path->tcont, path->alloc_id, true, true);
 			}
 			if (ret) return ret;
-			ret = rtl_itu_puc_tcont(&io, path->tcont, 255);
+			ret = rtl_itu_puc_schedule(&io, path->tcont, 255, paths->weights[path->tcont]);
 			if (ret) return ret;
 			queues[path->tcont / 4] |= 255U << ((path->tcont % 4) * 8);
 			active |= BIT(path->tcont);
+			alloc[path->tcont] = path->alloc_id | BIT(24);
 		}
 		if (gpon) {
 			/* GTC keeps PLOAM's AES decision in the hardware table. */
@@ -146,22 +156,32 @@ static int path_program(struct rtl9617c_pon *pon, const struct rtl_itu_paths *pa
 		ret = path_access(pon, 0x9020, 0xc0000000U | index);
 		if (ret) return ret;
 	}
-	for (i = 0; i < 8; i++) writel(queues[i], pon->mac + 0x81bc - i * 4);
+	for (i = 0; i < 8; i++) {
+		if (!gpon && pon->xgpon_restore_pending) {
+			pon->xgpon_puc_saved.valid[i] = queues[i];
+			writel(i ? 0 : queues[i] & 255, pon->mac + 0x81bc - i * 4);
+		} else {
+			writel(queues[i], pon->mac + 0x81bc - i * 4);
+		}
+	}
+	if (!gpon)
+		memcpy(pon->xgpon_restore_tcont, alloc, sizeof(alloc));
 	return 0;
 }
 
-ssize_t rtl_pon_itu_paths_write(struct rtl9617c_pon *pon, const char *buf, size_t count)
+ssize_t rtl_pon_itu_paths_write(struct rtl9617c_pon *pon, const char *buf, size_t count, u64 session)
 {
 	struct rtl_itu_path_state *state, *old;
 	struct net_device *dev;
-	unsigned int i, j, entries, profiles, unique = 0, cursor;
+	unsigned int i, j, entries, profiles, schedules, schedule_mask = 0, unique = 0, cursor;
 	int ret = 0;
 
-	if (count < 12 || get_unaligned_le16(buf) != 3 || get_unaligned_le32(buf + 8) != count) return -EINVAL;
+	if (count < 12 || get_unaligned_le16(buf) != 4 || get_unaligned_le32(buf + 8) != count) return -EINVAL;
 	entries = get_unaligned_le16(buf + 2);
 	profiles = get_unaligned_le16(buf + 4);
+	schedules = get_unaligned_le16(buf + 6);
 	cursor = 12 + entries * RTL_ITU_PATH_WIRE_BYTES;
-	if (entries > RTL_ITU_PATH_MAX || profiles > entries * RTL_EVTO_STAGES || cursor > count) return -EMSGSIZE;
+	if (entries > RTL_ITU_PATH_MAX || profiles > entries * RTL_EVTO_STAGES || schedules > 31 || cursor > count) return -EMSGSIZE;
 	state = kvzalloc(sizeof(*state) + profiles * sizeof(struct rtl_evto_profile), GFP_KERNEL);
 	if (!state) return -ENOMEM;
 	state->paths.count = entries;
@@ -229,9 +249,35 @@ ssize_t rtl_pon_itu_paths_write(struct rtl9617c_pon *pon, const char *buf, size_
 		if (!rtl_evto_valid(profile)) { ret = -EINVAL; goto free; }
 		cursor += 32 + profile->count * 16;
 	}
-	if (cursor != count) { ret = -EMSGSIZE; goto free; }
+	if (count - cursor != schedules * RTL_ITU_SCHEDULE_WIRE_BYTES) { ret = -EMSGSIZE; goto free; }
+	for (i = 0; i < schedules; i++) {
+		const u8 *record = (const u8 *)buf + cursor + i * RTL_ITU_SCHEDULE_WIRE_BYTES;
+		unsigned int tcont = get_unaligned_le16(record), used = 0;
+		bool strict = false;
+
+		if (!tcont || tcont > 31 || get_unaligned_le16(record + 2) ||
+		    (schedule_mask & BIT(tcont))) { ret = -EINVAL; goto free; }
+		for (j = 0; j < entries; j++)
+			if (state->paths.path[j].tcont == tcont && !state->paths.path[j].multicast)
+				used = 1;
+		if (!used || !!record[4] != !!record[5]) { ret = -EINVAL; goto free; }
+		/* Stock PUC programming keeps WRR below SP and couples queue0/1. */
+		for (j = 0; j < 8; j++) {
+			if (!record[4 + j]) strict = true;
+			else if (strict) { ret = -EINVAL; goto free; }
+		}
+		memcpy(state->paths.weights[tcont], record + 4, 8);
+		schedule_mask |= BIT(tcont);
+	}
+
 	mutex_lock(&pon->control_lock);
 	mutex_lock(&pon->lock);
+	if (session != pon->itu_line_epoch) {
+		ret = -ESTALE; goto unlock;
+	}
+	if (pon->gpon_drain.phase || pon->xgpon_recovery_phase) {
+		ret = -EBUSY; goto unlock;
+	}
 	if (rtl_pon_mode_is_epon(pon->mode) || !pon->puc_configured || !pon->pdc_configured) {
 		ret = -EOPNOTSUPP; goto unlock;
 	}
@@ -248,7 +294,7 @@ ssize_t rtl_pon_itu_paths_write(struct rtl9617c_pon *pon, const char *buf, size_
 		goto unlock;
 	dev = rcu_access_pointer(pon->data_devices[0]);
 	netif_tx_disable(dev);
-	rtl_pon_itu_paths_invalidate(pon);
+	rtl_pon_itu_paths_invalidate(pon, pon->mode);
 	ret = pon->itu_paths_error;
 	if (ret) goto wake;
 	ret = path_program(pon, &state->paths);
@@ -277,10 +323,11 @@ ssize_t rtl_pon_itu_paths_upload(struct rtl9617c_pon *pon, const char *buf, loff
 {
 	void *complete = NULL;
 	size_t bytes = 0;
+	u64 session = 0;
 	int ret = 0;
 	mutex_lock(&pon->control_lock);
 	if (!offset) {
-		if (count < 12 || get_unaligned_le16(buf) != 3) { ret = -EINVAL; goto unlock; }
+		if (count < 12 || get_unaligned_le16(buf) != 4) { ret = -EINVAL; goto unlock; }
 		bytes = get_unaligned_le32(buf + 8);
 		if (bytes < 12 || bytes > RTL_ITU_CONFIG_WIRE_MAX) { ret = -EMSGSIZE; goto unlock; }
 		kvfree(pon->itu_upload);
@@ -288,6 +335,7 @@ ssize_t rtl_pon_itu_paths_upload(struct rtl9617c_pon *pon, const char *buf, loff
 		pon->itu_upload_received = 0;
 		pon->itu_upload_size = bytes;
 		if (!pon->itu_upload) { ret = -ENOMEM; goto unlock; }
+		pon->itu_upload_epoch = READ_ONCE(pon->itu_line_epoch);
 	}
 	if (!pon->itu_upload || offset != pon->itu_upload_received ||
 	    count > pon->itu_upload_size - pon->itu_upload_received) { ret = -EINVAL; goto unlock; }
@@ -295,12 +343,13 @@ ssize_t rtl_pon_itu_paths_upload(struct rtl9617c_pon *pon, const char *buf, loff
 	pon->itu_upload_received += count;
 	if (pon->itu_upload_received == pon->itu_upload_size) {
 		complete = pon->itu_upload; bytes = pon->itu_upload_size;
+		session = pon->itu_upload_epoch;
 		pon->itu_upload = NULL;
 	}
 unlock:
 	mutex_unlock(&pon->control_lock);
 	if (complete) {
-		ret = rtl_pon_itu_paths_write(pon, complete, bytes);
+		ret = rtl_pon_itu_paths_write(pon, complete, bytes, session);
 		kvfree(complete);
 	}
 	return ret < 0 ? ret : count;

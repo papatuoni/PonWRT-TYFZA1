@@ -99,6 +99,42 @@ static void rtl_pon_gearbox_release(struct rtl9617c_pon *pon)
 	pon->gearbox_ready = true;
 }
 
+int rtl_pon_serdes_restart_locked(struct rtl9617c_pon *pon)
+{
+	static const u32 cdr_reset[] = {0x80, 0xd0, 0x70, 0};
+	u32 value, status;
+	unsigned int i;
+	int ret;
+
+	lockdep_assert_held(&pon->control_lock);
+	lockdep_assert_held(&pon->lock);
+	/* Original aal_psds_reset leaves PRBS test paths running. */
+	if (readl(pon->mac + PSDS_GBOX) & 3)
+		return 0;
+	writel(BIT(31) | 0x400, pon->mac + PSDS_ACCESS);
+	ret = readl_poll_timeout(pon->mac + PSDS_ACCESS, status, !(status & BIT(31)), 1, 10000);
+	if (ret)
+		return ret;
+	value = readl(pon->mac + PSDS_DATAOUT) & ~GENMASK(7, 4);
+	for (i = 0; i < ARRAY_SIZE(cdr_reset); i++) {
+		writel(value | cdr_reset[i], pon->mac + PSDS_DATAIN);
+		writel(BIT(31) | BIT(30) | 0x400, pon->mac + PSDS_ACCESS);
+		ret = readl_poll_timeout(pon->mac + PSDS_ACCESS, status, !(status & BIT(31)), 1, 10000);
+		if (ret)
+			return ret;
+		msleep(1);
+	}
+	msleep(10);
+	rtl_pon_gearbox_release(pon);
+	rtl_pon_update(pon->mac + 0xa084, BIT(0), BIT(0));
+	msleep(1);
+	/* Activation also starts on LOS; expose the original RX-init wait result. */
+	pon->sync_result = readl_poll_timeout(pon->mac + PSDS_STATUS, pon->serdes_status,
+		(pon->serdes_status & 0x8c01) == 0x8c00, 1000, 1000000);
+	pon->rx_synced = (pon->serdes_status & PSDS_SYNC_MASK) == PSDS_SYNC_GOAL;
+	return 0;
+}
+
 static void rtl_pon_serdes_work(struct work_struct *work)
 {
 	struct rtl9617c_pon *pon = container_of(to_delayed_work(work), struct rtl9617c_pon, serdes_work);
@@ -106,6 +142,9 @@ static void rtl_pon_serdes_work(struct work_struct *work)
 	mutex_lock(&pon->lock);
 	pon->serdes_status = readl(pon->mac + PSDS_STATUS);
 	if ((pon->serdes_status & PSDS_SYNC_MASK) == PSDS_SYNC_GOAL) {
+		/* Complete the original ITU handoff when initial LOS delayed sync. */
+		if (!rtl_pon_mode_is_epon(pon->mode) && !pon->rx_synced)
+			rtl_pon_update(pon->epon_control, BIT(0), 0);
 		if (!pon->rx_synced)
 			dev_info(pon->dev, "%s SerDes RX clocks synchronized\n", rtl_pon_mode_name(pon->mode));
 		pon->sync_result = 0;
@@ -122,13 +161,17 @@ static void rtl_pon_serdes_work(struct work_struct *work)
 void rtl_pon_serdes_init_work(struct rtl9617c_pon *pon)
 {
 	INIT_DELAYED_WORK(&pon->serdes_work, rtl_pon_serdes_work);
+	INIT_DELAYED_WORK(&pon->gpon_recovery_work, rtl_pon_gpon_recovery);
 	INIT_DELAYED_WORK(&pon->xgpon_recovery_work, rtl_pon_xgpon_recovery);
+	INIT_DELAYED_WORK(&pon->xgpon_health_work, rtl_pon_xgpon_health);
 }
 
 void rtl_pon_serdes_stop_work(struct rtl9617c_pon *pon)
 {
 	cancel_delayed_work_sync(&pon->serdes_work);
+	cancel_delayed_work_sync(&pon->gpon_recovery_work);
 	cancel_delayed_work_sync(&pon->xgpon_recovery_work);
+	cancel_delayed_work_sync(&pon->xgpon_health_work);
 }
 
 int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode mode)
@@ -145,10 +188,18 @@ int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode 
 	ret = rtl_pon_profile_validate(fw);
 	if (ret)
 		goto release;
-	rtl_pon_gpon_stop_locked(pon);
-	rtl_pon_xgpon_stop_locked(pon);
-	rtl_pon_mpcp_stop_locked(pon);
-	rtl_pon_epon_traffic_locked(pon, false);
+	ret = rtl_pon_stop_locked(pon);
+	if (!ret) {
+		mutex_lock(&pon->lock);
+		ret = rtl_pon_itu_paths_invalidate(pon, mode);
+		mutex_unlock(&pon->lock);
+	}
+	if (ret) {
+		mutex_lock(&pon->lock);
+		pon->serdes_error = ret;
+		mutex_unlock(&pon->lock);
+		goto release;
+	}
 	cancel_delayed_work_sync(&pon->serdes_work);
 	mutex_lock(&pon->lock);
 	pon->serdes_configured = false;
@@ -158,6 +209,9 @@ int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode 
 	pon->puc_configured = false;
 	pon->pdc_configured = false;
 	pon->xgpon_pending_valid = false;
+	/* Original family deinit resets both data blocks before the new mode. */
+	rtl_pon_update(pon->control, BIT(8) | BIT(9), 0);
+	msleep(100);
 	pon->mode = mode;
 	rtl_pon_update(pon->optical_control, BIT(30), pon->los_invert << 30);
 	rtl_pon_update(pon->control, BIT(0), epon ? BIT(0) : 0);

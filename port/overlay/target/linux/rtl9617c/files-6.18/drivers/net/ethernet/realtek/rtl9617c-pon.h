@@ -11,10 +11,30 @@
 #include "rtl9617c-pon-mode.h"
 #include "rtl9617c-mpcp-backoff.h"
 #include "rtl9617c-pon-path.h"
+#include "rtl9617c-xgtc-recovery.h"
 
 struct rtl_itu_path_state {
 	struct rcu_head rcu;
 	struct rtl_itu_paths paths;
+};
+
+struct platform_device;
+
+enum rtl_gpon_drain_phase {
+	RTL_GPON_DRAIN_IDLE, RTL_GPON_DRAIN_INVALIDATE, RTL_GPON_DRAIN_PORT, RTL_GPON_DRAIN_ALLOC,
+	RTL_GPON_DRAIN_PROBE, RTL_GPON_DRAIN_PROBE_WAIT, RTL_GPON_DRAIN_QUEUE,
+	RTL_GPON_DRAIN_MAP, RTL_GPON_DRAIN_GTC, RTL_GPON_DRAIN_FLUSH,
+	RTL_GPON_DRAIN_FLUSH_WAIT, RTL_GPON_DRAIN_RESTORE, RTL_GPON_DRAIN_PORT_RESTORE,
+	RTL_GPON_DRAIN_RESET, RTL_GPON_DRAIN_OMCC,
+};
+
+struct rtl_gpon_drain {
+	enum rtl_gpon_drain_phase phase;
+	unsigned int port, queue, probe;
+	u32 config, drop, gtc, valid[8], pvt[5], limit;
+	u32 bytes[8], packets[8], alloc_word;
+	u16 alloc_id;
+	bool alloc_saved;
 };
 
 struct rtl9617c_pon {
@@ -32,13 +52,36 @@ struct rtl9617c_pon {
 	void __iomem *optical_irq;
 	void __iomem *top_irq;
 	struct mutex lock;
-	/* Control transactions precede state lock. Work/IRQ threads use only lock;
-	 * cancel_delayed_work_sync must run without holding that state lock. */
+	/* Control and recovery transactions precede the state lock. Synchronous
+	 * recovery-work cancellation runs without either lock held. */
 	struct mutex control_lock;
 	struct delayed_work serdes_work;
 	struct delayed_work mpcp_work;
+	struct delayed_work gpon_recovery_work;
+	bool gpon_recover;
+	struct rtl_gpon_drain gpon_drain;
 	struct delayed_work xgpon_recovery_work;
+	struct delayed_work xgpon_health_work;
 	bool xgpon_recover;
+	bool xgpon_watchdog_armed, xgpon_restore_pending;
+	bool xgpon_rogue_pending;
+	u32 xgpon_rogue_last_ms, xgpon_rogue_count[2];
+	unsigned long xgpon_health_at, xgpon_restore_at;
+	u32 xgpon_health_state, xgpon_health_grants, xgpon_health_matches, xgpon_health_no_grants;
+	u64 xgpon_mac_resets, xgpon_health_fec, xgpon_health_sn;
+	u32 xgpon_reset_reason;
+	/* OMCI-owned allocations survive hardware resets, like stock tmp_alloc_id_cfg. */
+	u32 xgpon_restore_tcont[32];
+	void __iomem *dying_gasp;
+	int dying_gasp_irq, dying_gasp_error;
+	bool dying_gasp_registered, dying_gasp_sent;
+	spinlock_t dying_gasp_lock;
+	struct sk_buff *dying_gasp_packet;
+	u8 dying_gasp_prefix[16];
+	u64 dying_gasp_tx;
+	/* 0 idle, 1 capture PUC, 2 flush/reset, 3 restore saved PUC. */
+	u8 xgpon_recovery_phase;
+	struct rtl_xgtc_puc_saved xgpon_puc_saved;
 	enum rtl_pon_mode mode;
 	unsigned int burst_polarity;
 	unsigned int los_invert;
@@ -111,6 +154,7 @@ struct rtl9617c_pon {
 	struct rtl_itu_path_state __rcu *itu_paths;
 	void *itu_upload;
 	size_t itu_upload_size, itu_upload_received;
+	u64 itu_upload_epoch;
 	bool itu_paths_ready;
 	int itu_paths_error;
 	u64 itu_path_epoch;
@@ -121,6 +165,7 @@ struct rtl9617c_pon {
 };
 
 void rtl_pon_update(void __iomem *reg, u32 mask, u32 value);
+int rtl_pon_serdes_restart_locked(struct rtl9617c_pon *pon);
 int rtl_pon_serdes_configure(struct rtl9617c_pon *pon, enum rtl_pon_mode mode);
 void rtl_pon_serdes_init_work(struct rtl9617c_pon *pon);
 void rtl_pon_serdes_stop_work(struct rtl9617c_pon *pon);
@@ -138,16 +183,18 @@ int rtl_pon_xgpon_activation_locked(struct rtl9617c_pon *pon, bool enable);
 void rtl_pon_xgpon_stop_locked(struct rtl9617c_pon *pon);
 void rtl_pon_xgpon_irq(struct rtl9617c_pon *pon);
 void rtl_pon_xgpon_recovery(struct work_struct *work);
+void rtl_pon_xgpon_health(struct work_struct *work);
+void rtl_pon_xgpon_optical_irq(struct rtl9617c_pon *pon, u32 events);
 int rtl_pon_xgpon_omci_key(struct rtl9617c_pon *pon, const u8 tag[8]);
 int rtl_pon_xgpon_ack_update(struct rtl9617c_pon *pon);
 void rtl_pon_xgpon_key_irq(struct rtl9617c_pon *pon, u32 interrupts, u32 control);
 ssize_t rtl_pon_omci_master_key(struct rtl9617c_pon *pon, const char *buf, size_t count);
 ssize_t rtl_pon_omci_broadcast_key(struct rtl9617c_pon *pon, const char *buf, size_t count);
-ssize_t rtl_pon_itu_paths_write(struct rtl9617c_pon *pon, const char *buf, size_t count);
+ssize_t rtl_pon_itu_paths_write(struct rtl9617c_pon *pon, const char *buf, size_t count, u64 session);
 ssize_t rtl_pon_itu_paths_upload(struct rtl9617c_pon *pon, const char *buf, loff_t offset, size_t count);
 ssize_t rtl_pon_itu_paths_state(struct rtl9617c_pon *pon, char *buf);
 void rtl_pon_itu_carrier(struct rtl9617c_pon *pon);
-void rtl_pon_itu_paths_invalidate(struct rtl9617c_pon *pon);
+int rtl_pon_itu_paths_invalidate(struct rtl9617c_pon *pon, enum rtl_pon_mode mode);
 void rtl_pon_itu_paths_remove(struct rtl9617c_pon *pon);
 netdev_tx_t rtl_pon_itu_data_transmit(struct rtl9617c_pon *pon, struct sk_buff *skb, struct net_device *dev);
 void rtl_pon_itu_data_receive(struct rtl9617c_pon *pon, struct napi_struct *napi,
@@ -155,8 +202,12 @@ void rtl_pon_itu_data_receive(struct rtl9617c_pon *pon, struct napi_struct *napi
 int rtl_pon_gpon_activation_locked(struct rtl9617c_pon *pon, bool enable);
 void rtl_pon_gpon_stop_locked(struct rtl9617c_pon *pon);
 void rtl_pon_gpon_irq(struct rtl9617c_pon *pon);
+void rtl_pon_gpon_recovery(struct work_struct *work);
 int rtl_pon_omci_init(struct rtl9617c_pon *pon);
 void rtl_pon_omci_remove(struct rtl9617c_pon *pon);
+int rtl_pon_dying_gasp_init(struct rtl9617c_pon *pon, struct platform_device *pdev);
+void rtl_pon_dying_gasp_prepare(struct rtl9617c_pon *pon);
+void rtl_pon_dying_gasp_stop(struct rtl9617c_pon *pon);
 void rtl_pon_omci_receive(struct rtl9617c_pon *pon, struct napi_struct *napi,
 			  struct sk_buff *skb, unsigned int source);
 ssize_t rtl_pon_ploam_receive(struct rtl9617c_pon *pon, char *buf, size_t count);
@@ -164,7 +215,7 @@ ssize_t rtl_pon_ploam_transmit(struct rtl9617c_pon *pon, const char *buf, size_t
 			     bool default_key);
 int rtl_pon_epon_traffic(struct rtl9617c_pon *pon, bool enable);
 int rtl_pon_mpcp_init(struct rtl9617c_pon *pon, int irq);
-void rtl_pon_mpcp_stop(struct rtl9617c_pon *pon);
+int rtl_pon_mpcp_stop(struct rtl9617c_pon *pon);
 int rtl_pon_mpcp_configure(struct rtl9617c_pon *pon);
 ssize_t rtl_pon_mpcp_state(struct rtl9617c_pon *pon, char *buf);
 ssize_t rtl_pon_llid_table(struct rtl9617c_pon *pon, char *buf);
@@ -183,6 +234,7 @@ int rtl_pon_oam_resize(struct rtl9617c_pon *pon, unsigned int count);
 void rtl_pon_oam_address(struct rtl9617c_pon *pon);
 
 /* Internal control steps: caller owns control_lock, never acquire it again. */
+int rtl_pon_stop_locked(struct rtl9617c_pon *pon);
 int rtl_pon_serdes_configure_locked(struct rtl9617c_pon *pon, enum rtl_pon_mode mode);
 int rtl_pon_epon_prepare_locked(struct rtl9617c_pon *pon);
 int rtl_pon_epon_traffic_locked(struct rtl9617c_pon *pon, bool enable);

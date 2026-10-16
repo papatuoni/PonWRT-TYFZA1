@@ -19,7 +19,7 @@
 #include "pon-omci.h"
 
 #define PON_SYSFS "/sys/bus/platform/devices/4f5500000.pon/"
-#define PATH_BYTES (12 + 248 * 50 + 248 * 5 * (32 + 32 * 16))
+#define PATH_BYTES (12 + 248 * 50 + 248 * 5 * (32 + 32 * 16) + 31 * 12)
 
 static int put_file(const char *path, const void *data, size_t length)
 {
@@ -62,7 +62,7 @@ static int load_identity(struct omci_identity *identity)
 	fclose(serial);
 	identity_field(&config, "equipment_id", "TYFZA1", identity->equipment, sizeof(identity->equipment));
 	identity_field(&config, "hardware_version", "RTL9617C", identity->hardware, sizeof(identity->hardware));
-	identity_field(&config, "software_version", "0.3.1-alpha", identity->software, sizeof(identity->software));
+	identity_field(&config, "software_version", "0.4.0-alpha", identity->software, sizeof(identity->software));
 	identity_field(&config, "loid", "", identity->loid, sizeof(identity->loid));
 	identity_field(&config, "loid_password", "", identity->password, sizeof(identity->password));
 	identity_field(&config, "operator_id", "CTC", identity->operator_id, sizeof(identity->operator_id));
@@ -201,7 +201,7 @@ int main(void)
 		length = tyfza1_omci_paths(agent, paths);
 		if (length < 0) {
 			/* A rejected graph must not leave its previous business mapping active. */
-			static const uint8_t empty[12] = {3, 0, 0, 0, 0, 0, 0, 0, 12};
+			static const uint8_t empty[12] = {4, 0, 0, 0, 0, 0, 0, 0, 12};
 			result = business.length ? apply_paths(&business, empty, sizeof(empty)) : 0;
 			if (!result) business.length = 0;
 			business.error = result ? result : length;

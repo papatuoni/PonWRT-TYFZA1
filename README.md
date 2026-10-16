@@ -2,7 +2,7 @@
 
 感谢 [PonWrt](https://github.com/pbs05/ponwrt) 在 PON 与 OpenWrt 整合、原厂身份和校准保留、硬件转发及排障思路上提供的参考。本项目针对天翼 TYFZA1 / Realtek RTL9617CVW 独立适配，OMCI 协议引擎使用其 GPL 源码；硬件配置以本机原厂实现为依据。
 
-**版本：0.3.1-alpha** · OpenWrt · Linux 6.18.55 · 四核 Cortex-A55
+**版本：0.4.0-alpha** · OpenWrt · Linux 6.18.55 · 四核 Cortex-A55
 
 本次更新见 [更新日志](RELEASE_NOTES.md)。
 
@@ -14,7 +14,7 @@
 | 原厂 telnet 安装、sysupgrade、断电启动 | 已实测 |
 | 四 LAN 网桥 | 已接入；四口逐口待测试 |
 | 2.5G 网口 | 驱动已接入，链路与硬件转发待测试 |
-| 双频 WiFi、WPA2、HT/VHT80、Wi-Fi 6 | HT/VHT 已实测；HE 协商与发包参数已接入，兼容性待测试 |
+| 双频 WiFi、WPA2、HT/VHT、Wi-Fi 6 | HT/VHT80、HE160/2SS 协商及 60 秒 CAC 已实测；已接入 DFS 检测，空口雷达响应与长期稳定性待测试 |
 | IPv4 路由/NAT、WiFi 双向硬件加速 | 双频上下行硬件路径已实测；持续高负载丢包待优化 |
 | EPON（1G/1G） | 独立 MAC/PCS/FEC、MPCP 和 CTC OAM 已接入；业务与硬件转发待测试 |
 | 10G-EPON 非对称（10G/1G） | 注册、CTC OAM、LOID、FEC、DHCP 和双向硬件路径已实测；PPPoE、桥接待测试 |

@@ -15,6 +15,7 @@ struct rtl9617c_ni_endpoint {
 
 struct rtl9617c_ni_frame {
 	u32 header_high;
+	/* pkt_size may give the valid length when the DMA payload includes padding. */
 	u32 header_low;
 	const u8 *prefix;
 	unsigned int prefix_length;
@@ -36,6 +37,7 @@ int rtl9617c_ni_wifi_peer_route(struct device *dev, struct net_device *netdev,
 
 int rtl9617c_ni_report_configure(struct device *dev, unsigned int low, unsigned int high);
 u32 rtl9617c_ni_report_state(struct device *dev);
+u32 rtl9617c_ni_pon_gate(struct device *dev, u32 enabled);
 int rtl9617c_ni_pon_attach(struct device *dev, struct rtl9617c_ni_endpoint *endpoint);
 void rtl9617c_ni_pon_detach(struct device *dev);
 int rtl9617c_ni_open(struct device *dev);

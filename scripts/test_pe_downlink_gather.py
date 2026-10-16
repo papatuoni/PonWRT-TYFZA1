@@ -14,14 +14,14 @@ directory = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / 'artifacts/pe-rad
 binary = (directory / 'pe-tx.bin').read_bytes()
 
 
-def case(lengths, cap, from_epp=False, hw_rts=False):
+def case(lengths, cap, from_epp=False, hw_rts=False, bandwidth=2, rate=0x100):
     base, mb, pages, headers, payload, ring, bar, ni, reports = (
         0x04000000, 0x04002000, 0x05100000, 0x05200000, 0x06000000,
         0x05000000, 0x12000000, 0x10000000, 0x06200000)
     u = Uc(UC_ARCH_MIPS, UC_MODE_MIPS32 | UC_MODE_LITTLE_ENDIAN)
     for at, size in [(0x1fc00000, 0x4000), (base, 0x20000), (pages, 0xc000),
                      (headers, 0xc000), (payload, 0x10000), (ring, 0x4000),
-                     (bar, 0x10000), (ni, 0x10000), (reports, 0x1000),
+                     (bar, 0x10000), (ni, 0x10000), (reports, 0x80000),
                      (0x10020000, 0x1000), (0x10030000, 0x1000)]:
         u.mem_map(at, size)
     u.mem_write(0x1fc00000, binary)
@@ -34,7 +34,7 @@ def case(lengths, cap, from_epp=False, hw_rts=False):
                          (30, 0), (38, len(lengths)), (116, 0x6380),
                          (117, 6), (140, mb | 0xa0000000)]:
         put(mb + index * 4, value)
-    peer = [0, 0, 26 << 16, 0x100 | 2 << 16 | (1 << 22 if hw_rts else 0),
+    peer = [0, 0, 26 << 16, rate | bandwidth << 16 | (1 << 22 if hw_rts else 0),
             1 << 24 | 1 << 18 | 1 << 16, 7 << 16 | 32, 0, 0]
     u.mem_write(base + 0xd020, struct.pack('<8I', *peer))
     put(base + 0xe204, cap << 18)
@@ -85,14 +85,16 @@ def case(lengths, cap, from_epp=False, hw_rts=False):
     u.reg_write(UC_MIPS_REG_SP, (base + 0x1fff0) | 0xa0000000)
     u.emu_start(0xbfc00400, 0xbfc03ffc, count=100000)
     assert get(mb + 28 * 4) == len(lengths) and get(mb + 38 * 4) == 0
-    assert get(mb + 30 * 4) == len(lengths) and not returns
+    assert get(mb + 30 * 4) == len(submits) and not returns
     assert get(base + 0x18020) == len(lengths)
     member = 0
     all_ids = []
     for slot in range(len(submits)):
-        page = bytes(u.mem_read(pages + (256 + member) * 128, 128))
+        page = bytes(u.mem_read(pages + (256 + slot) * 128, 128))
         count = struct.unpack_from('<I', page, 4)[0] >> 26
         assert bool(struct.unpack_from('<I', page, 32)[0] & (1 << 12)) == hw_rts
+        assert struct.unpack_from('<I', page, 28)[0] >> 28 & 3 == bandwidth
+        assert struct.unpack_from('<I', page, 28)[0] >> 16 & 0x1ff == rate
         expected = bytes.fromhex('88420000') + dst + ap
         expected += (ap if count > 1 else frames[member][6:12]) + struct.pack('<H', slot << 4)
         expected += bytes([128 if count > 1 else 0, 0])
@@ -115,24 +117,23 @@ def case(lengths, cap, from_epp=False, hw_rts=False):
         assert gathered == expected, (lengths, count, len(gathered), len(expected))
         assert struct.unpack_from('<I', page, 8)[0] & 0x3fff == len(gathered)
         assert len(gathered) - 26 <= cap or count == 1
-        chain = member
+        chain = get(base + 0xc400 + slot * 8)
         for n in range(count):
-            assert chain == member + n
-            details = get(base + 0xc404 + chain * 8)
-            assert bool(details & (1 << 15)) == (n + 1 == count)
-            chain = (details >> 24) & 127
+            assert chain == payload + (member + n) * 2048
+            chain = get(chain)
+        assert chain == 0
         all_ids.append(ids)
         member += count
     assert member == len(lengths)
     put(mb + 68 * 4, reports)
-    put(mb + 72 * 4, reports + 512)
+    put(mb + 72 * 4, reports + 0x40000)
     for slot, ids in enumerate(all_ids):
-        put(reports + slot * 512, 24 | 0xc000 | (slot + 1) << 16)
-        put(reports + slot * 512 + 4, 7 << 24 | 4)
-        put(reports + slot * 512 + 20, (256 + ids[0]) << 16 | 1)
+        put(reports + slot * 1024, 24 | 0xc000 | (slot + 1) << 16)
+        put(reports + slot * 1024 + 4, 7 << 24 | 4)
+        put(reports + slot * 1024 + 20, (256 + slot) << 16 | 1)
     put(bar + 0x121c, len(all_ids) << 16)
     u.emu_start(u.reg_read(UC_MIPS_REG_PC), 0xbfc03ffc, count=100000)
-    assert get(mb + 45 * 4) == len(lengths) and not returns
+    assert get(mb + 45 * 4) == len(submits) and not returns
     put(ni + 0x6340, 0x8000007c)
     put(ni + 0x6380, 0x80000000)
     u.emu_start(u.reg_read(UC_MIPS_REG_PC), 0xbfc03ffc, count=100000)
@@ -142,13 +143,17 @@ def case(lengths, cap, from_epp=False, hw_rts=False):
     for n, frame in enumerate(frames):
         assert bytes(u.mem_read(payload + n * 2048 + 62, len(frame) - 14)) == frame[14:]
         assert get(base + 0xc400 + n * 8) == 0
-    return {'lengths': lengths, 'cap': cap, 'MPDUs': len(submits), 'from_EPP': from_epp, 'HW_RTS': hw_rts}
+    return {'lengths': lengths, 'cap': cap, 'MPDUs': len(submits), 'from_EPP': from_epp, 'HW_RTS': hw_rts, 'bandwidth': bandwidth, 'rate': rate}
 
 
-rows = [case([64 + (n + pad) % 4 for n in range(count)], 7935)
-        for count in range(2, 9) for pad in range(4)]
-rows += [case([1500] * 8, 7935), case([1500] * 8, 3839)]
-rows += [case([1514] * 8, 7935, True), case([64, 65, 66, 67], 7935, True)]
-rows += [case([1514] * 4, 7935, True, True)]
+if len(sys.argv) > 2 and sys.argv[2] == '--160':
+    rows = [case([1514] * 4, 7935, True, bandwidth=3, rate=rate) for rate in (0x119, 0x19b)]
+else:
+    rows = [case([64 + (n + pad) % 4 for n in range(count)], 7935)
+            for count in range(2, 9) for pad in range(4)]
+    rows += [case([1500] * 8, 7935), case([1500] * 8, 3839)]
+    rows += [case([1514] * 8, 7935, True), case([64, 65, 66, 67], 7935, True)]
+    rows += [case([1514] * 4, 7935, True, True)]
 print(json.dumps({'cases': rows, 'exact_headers_payload_padding_DMA': True,
+                  'one_WP_per_aggregate': True,
                   'ownership_until_RPQ_and_EQ_credit': True}, indent=2))

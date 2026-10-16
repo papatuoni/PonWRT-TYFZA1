@@ -218,6 +218,8 @@ static int ni_test_release(struct rtl_ax_tx *tx)
 		readl(tx->ni.regs + 0x6108);
 		if (!ni_epps_empty(tx)) return -EBUSY;
 		if (get_unaligned_le32(tx->pe.memory + PE_PROBE_MAILBOX + 152)) return -EBUSY;
+		/* Empty EPPs do not account for WPs awaiting RPQ or EQ return. */
+		if (get_unaligned_le32(tx->pe.memory + PE_PROBE_MAILBOX + 120)) return -EBUSY;
 	}
 	if (tx->ni.vp_active) {
 		writel(0, tx->ni.vp);
@@ -352,14 +354,22 @@ static int ni_test_remove(struct rtl_ax_tx *tx)
 	if (ret) return ret;
 	writel(tx->ni.vp_saved[1], tx->ni.vp + 8); writel(tx->ni.vp_saved[2], tx->ni.vp + 12);
 	writel(BIT(31) | BIT(30), tx->ni.vp + 4);
-	readl_poll_timeout(tx->ni.vp + 4, status, !(status & BIT(31)), 1, 100000);
+	ret = readl_poll_timeout(tx->ni.vp + 4, status, !(status & BIT(31)), 1, 100000);
+	if (ret) return ret;
 	writel(tx->ni.vp_saved[3], tx->ni.vp + 0x64); writel(tx->ni.vp_saved[4], tx->ni.vp + 0x78);
 	writel((readl(tx->ni.dma + 0x14) & ~(3U << (tx->ni.vp_index * 2))) | (tx->ni.vp_saved[0] & (3U << (tx->ni.vp_index * 2))), tx->ni.dma + 0x14);
 	for (i = 0; i < 128; i++) {
 		u32 address = get_unaligned_le32(tx->pe.memory + 0xc400 + i * 8);
-		if (!address) continue;
-		readl_poll_timeout(tx->ni.regs + (0x6368 + tx->ni.cpu * 8), status, status & BIT(31), 1, 100000);
-		writel(address | tx->ni.eq, tx->ni.regs + (0x636c + tx->ni.cpu * 8));
+		while (address) {
+			u32 next;
+			dma_sync_single_for_cpu(tx->dma_device, address, 4, DMA_FROM_DEVICE);
+			next = get_unaligned_le32(phys_to_virt(address));
+			ret = readl_poll_timeout(tx->ni.regs + (0x6368 + tx->ni.cpu * 8), status, status & BIT(31), 1, 100000);
+			if (ret) return ret;
+			writel(address | tx->ni.eq, tx->ni.regs + (0x636c + tx->ni.cpu * 8));
+			put_unaligned_le32(next, tx->pe.memory + 0xc400 + i * 8);
+			address = next;
+		}
 	}
 	/* Queued BIDs have no WP owner yet; their links remain in BID headroom. */
 	for (i = 0; i < 128 * 8; i++) {
@@ -368,8 +378,10 @@ static int ni_test_remove(struct rtl_ax_tx *tx)
 			u32 next;
 			dma_sync_single_for_cpu(tx->dma_device, address, 16, DMA_FROM_DEVICE);
 			next = get_unaligned_le32(phys_to_virt(address + 12)) & ~127U;
-			readl_poll_timeout(tx->ni.regs + (0x6368 + tx->ni.cpu * 8), status, status & BIT(31), 1, 100000);
+			ret = readl_poll_timeout(tx->ni.regs + (0x6368 + tx->ni.cpu * 8), status, status & BIT(31), 1, 100000);
+			if (ret) return ret;
 			writel(address | tx->ni.eq, tx->ni.regs + (0x636c + tx->ni.cpu * 8));
+			put_unaligned_le32(next, tx->pe.memory + 0x15000 + i * 4);
 			address = next;
 		}
 	}

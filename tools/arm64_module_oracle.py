@@ -11,7 +11,7 @@ from unicorn.arm64_const import UC_ARM64_REG_X0, UC_ARM64_REG_X1, UC_ARM64_REG_X
 
 
 class ModuleOracle:
-    def __init__(self, module, names, handler):
+    def __init__(self, module, names, handler, external_symbols=None):
         self.uc = Uc(UC_ARCH_ARM64, UC_MODE_ARM)
         self.sections, self.symbols, self.functions, self.hooks = {}, {}, {}, {}
         self.trampoline, self.scratch = 0x4000000, 0x5000000
@@ -61,6 +61,8 @@ class ModuleOracle:
                         value = self.callback(symbol.name)
                     elif symbol['st_shndx'] in self.sections:
                         value = self.sections[symbol['st_shndx']] + symbol['st_value'] + rel['r_addend']
+                    elif symbol.name in (external_symbols or {}):
+                        value = external_symbols[symbol.name] + rel['r_addend']
                     elif not is_code:
                         continue
                     else:

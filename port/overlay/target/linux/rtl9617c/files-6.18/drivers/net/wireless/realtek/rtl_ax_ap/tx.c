@@ -81,9 +81,9 @@ struct rtl_ax_tx {
 	DECLARE_BITMAP(pending, RTL_AX_TX_ENTRIES);
 	unsigned int producer[RTL_AX_TX_RINGS];
 	u64 submitted_ring[RTL_AX_TX_RINGS], completed_ring[RTL_AX_TX_RINGS];
-	bool running, paused;
+	bool running, paused, dfs_blocked;
 	bool checksum_enabled;
-	bool queues_stopped;
+	bool queues_stopped, queues_paused;
 	unsigned int occupied;
 	u64 queue_stops, queue_wakes;
 	u64 ampdu_submitted, ampdu_completed;
@@ -97,6 +97,14 @@ struct rtl_ax_tx {
 
 struct device *rtl_ax_tx_dma_device(struct rtl_ax_tx *tx) { return tx->dma_device; }
 void rtl_ax_tx_bind_rx(struct rtl_ax_tx *tx, struct rtl_ax_rx *rx) { tx->rx = rx; }
+void rtl_ax_tx_bind_hw(struct rtl_ax_tx *tx, struct ieee80211_hw *hw)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tx->lock, flags);
+	tx->hw = hw;
+	spin_unlock_irqrestore(&tx->lock, flags);
+}
 void rtl_ax_tx_bind_ready(struct rtl_ax_tx *tx, void (*ready)(void *), void *context)
 {
 	tx->peer_ready = ready;
@@ -232,10 +240,18 @@ release:
 int rtl_ax_tx_pause(struct rtl_ax_tx *tx)
 {
 	const struct rtl_ax_io *io = tx->io;
+	struct ieee80211_hw *hw;
 	unsigned long flags;
 	unsigned int i;
 	u32 pe_command = 0;
 
+	spin_lock_irqsave(&tx->lock, flags);
+	tx->queues_paused = true;
+	hw = tx->hw;
+	if (hw) ieee80211_stop_queues(hw);
+	spin_unlock_irqrestore(&tx->lock, flags);
+	/* Finish dequeued TX callbacks before closing admission to the PE. */
+	if (hw) synchronize_net();
 	spin_lock_irqsave(&tx->lock, flags);
 	tx->running = false;
 	spin_unlock_irqrestore(&tx->lock, flags);
@@ -253,7 +269,8 @@ int rtl_ax_tx_pause(struct rtl_ax_tx *tx)
 		dma_wmb();
 	}
 	if (!tx->paused) {
-		tx->scheduler_saved = io->read32(io->ctx, 0xc398) & 0x3ffff;
+		if (!tx->dfs_blocked)
+			tx->scheduler_saved = io->read32(io->ctx, 0xc398) & 0x3ffff;
 		tx->paused = true;
 	}
 	/* Actual set_hw_sch_tx_en C/XB writes C398, 18 queue bits.
@@ -277,6 +294,21 @@ int rtl_ax_tx_pause(struct rtl_ax_tx *tx)
 	return -ETIMEDOUT;
 }
 
+/* DFS pauses the same18 hardware queues as RFK, without waiting for
+ * RPQ inside the RX worker. A later RFK/open must retain the DFS block. */
+void rtl_ax_tx_dfs_block(struct rtl_ax_tx *tx, bool blocked)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&tx->lock, flags);
+	if (blocked && !tx->dfs_blocked && !tx->paused)
+		tx->scheduler_saved = tx->io->read32(tx->io->ctx, 0xc398) & 0x3ffff;
+	tx->dfs_blocked = blocked;
+	rtl_ax_update32(tx->io, 0xc398, 0x3ffff,
+		blocked || tx->paused ? 0 : tx->scheduler_saved | BIT(8));
+	spin_unlock_irqrestore(&tx->lock, flags);
+}
+
 void rtl_ax_tx_open(struct rtl_ax_tx *tx)
 {
 	const struct rtl_ax_io *io = tx->io;
@@ -284,10 +316,11 @@ void rtl_ax_tx_open(struct rtl_ax_tx *tx)
 
 	spin_lock_irqsave(&tx->lock, flags);
 	tx->checksum_enabled = !!(io->read32(io->ctx, 0x8830) & BIT(0));
-	rtl_ax_update32(io, 0xc398, 0x3ffff, tx->scheduler_saved | BIT(8));
+	rtl_ax_update32(io, 0xc398, 0x3ffff, tx->dfs_blocked ? 0 : tx->scheduler_saved | BIT(8));
 	rtl_ax_update32(io, 0x1010, RTL_AX_TX_STOP_MASK | BIT(19), 0);
 	tx->paused = false;
 	tx->running = true;
+	tx->queues_paused = false;
 	if (tx->pe_active) {
 		tx->pe_command += 2;
 		put_unaligned_le32(tx->pe_command | 1, tx->pe.memory + PE_PROBE_MAILBOX + 12);
@@ -297,8 +330,9 @@ void rtl_ax_tx_open(struct rtl_ax_tx *tx)
 	    (tx->pe_active && get_unaligned_le32(tx->pe.memory + PE_PROBE_MAILBOX + 96) ? 48 : RTL_AX_TX_ENTRIES / 2)) {
 		tx->queues_stopped = false;
 		tx->queue_wakes++;
-		ieee80211_wake_queues(tx->hw);
 	}
+	if (tx->hw && !tx->queues_stopped)
+		ieee80211_wake_queues(tx->hw);
 	spin_unlock_irqrestore(&tx->lock, flags);
 }
 
@@ -427,14 +461,23 @@ void rtl_ax_tx_ps_release(struct rtl_ax_tx *tx, struct ieee80211_sta *sta,
 	unsigned int macid, u16 tids, bool uapsd, bool more_data)
 {
 	u32 *ps;
-	if (!rtl_ax_tx_ni_buffered(tx, macid)) {
+	bool queued = false;
+
+	/* ARM in-flight TIDs are announced too, but cannot consume a NI grant. */
+	if (rtl_ax_tx_ni_buffered(tx, macid))
+		for (unsigned int tid = 0; tid < 8; tid++)
+			if ((tids & BIT(tid)) && get_unaligned_le32(tx->pe.memory +
+			    0x13000 + (macid * 8 + tid) * 4)) {
+				queued = true;
+				break;
+			}
+	if (!queued) {
 		ieee80211_sta_eosp(sta);
 		return;
 	}
 	ps = tx->pe.memory + 0xe800 + macid * 16;
-	/* One frame ends this service period; the next poll grants a new one. */
-	for (unsigned int tid = 0; tid < 8; tid++)
-		ieee80211_sta_set_buffered(sta, tid, get_unaligned_le32(tx->pe.memory + 0x13000 + (macid * 8 + tid) * 4) > ((tids & BIT(tid)) ? 1 : 0));
+	/* Keep TIM tied to pending ownership until RPQ. Clearing it at grant
+	 * loses a new arrival while the PE pending mask remains nonzero. */
 	put_unaligned_le32(uapsd | more_data << 1 | (u32)tids << 16, ps + 3);
 	dma_wmb();
 	put_unaligned_le32(get_unaligned_le32(ps + 1) + 1, ps + 1);
@@ -488,7 +531,7 @@ int rtl_ax_tx_submit(struct rtl_ax_tx *tx, struct ieee80211_hw *hw,
 	addresses = ret;
 	header = (void *)skb->data;
 	spin_lock_irqsave(&tx->lock, flags);
-	if (!tx->running) {
+	if (!tx->running || tx->dfs_blocked) {
 		tx->stopped++;
 		ret = -ENETDOWN;
 		goto unmap;
@@ -601,7 +644,6 @@ int rtl_ax_tx_submit(struct rtl_ax_tx *tx, struct ieee80211_hw *hw,
 	slot.key_index = info->control.hw_key ? info->control.hw_key->hw_key_idx : 0;
 	tx->slots[id] = slot;
 	__set_bit(id, tx->pending);
-	tx->hw = hw;
 	tx->occupied++;
 	if (!tx->pe_active)
 		rtl_ax_txbd(tx->ring + (ring * RTL_AX_TX_ENTRIES + tx->producer[ring]) * 8,
@@ -647,15 +689,11 @@ static void rtl_ax_tx_pe_complete(struct rtl_ax_tx *tx, unsigned int id, unsigne
 {
 	unsigned int member = id - 256;
 
-	for (;;) {
-		void *entry = tx->pe.memory + 0xc400 + member * 8;
-		u32 details = get_unaligned_le32(entry + 4);
-		put_unaligned_le32(details | BIT(31) | status, entry + 4);
-		put_unaligned_le32(member, tx->pe.memory + 0xc800 + tx->ni_rpq_producer * 4);
-		tx->ni_rpq_producer = (tx->ni_rpq_producer + 1) & 127;
-		if (details & BIT(15)) break;
-		member = (details >> 24) & 127;
-	}
+	void *entry = tx->pe.memory + 0xc400 + member * 8;
+	u32 details = get_unaligned_le32(entry + 4);
+	put_unaligned_le32(details | BIT(31) | status, entry + 4);
+	put_unaligned_le32(member, tx->pe.memory + 0xc800 + tx->ni_rpq_producer * 4);
+	tx->ni_rpq_producer = (tx->ni_rpq_producer + 1) & 127;
 	dma_wmb();
 	put_unaligned_le32(tx->ni_rpq_producer, tx->pe.memory + PE_PROBE_MAILBOX + 180);
 }
@@ -738,7 +776,7 @@ int rtl_ax_tx_report(struct rtl_ax_tx *tx, struct ieee80211_hw *hw, const struct
 		tx->completed_ring[ring]++;
 		tx->status_count[status]++;
 		tx->polluted += !!(report & BIT(31));
-		if (tx->queues_stopped && tx->running && tx->occupied <=
+		if (tx->queues_stopped && tx->running && !tx->queues_paused && tx->hw && tx->occupied <=
 		    (tx->pe_active && get_unaligned_le32(tx->pe.memory + PE_PROBE_MAILBOX + 96) ? 48 : RTL_AX_TX_ENTRIES / 2)) {
 			tx->queues_stopped = false;
 			tx->queue_wakes++;
@@ -792,7 +830,7 @@ static bool rtl_ax_tx_pe_pending(struct rtl_ax_tx *tx, unsigned int macid, unsig
 		for (i = 0; i < 8; i++)
 			if ((tid == IEEE80211_NUM_TIDS || tid == i) &&
 			    get_unaligned_le32(tx->pe.memory + 0x13000 + (macid * 8 + i) * 4)) return true;
-	/* NI_WAIT retains the TID after submission, until RPQ releases the BID. */
+	/* NI_WAIT retains the submitted TID; RPQ done ends the MAC/key wait. */
 	for (i = 0; i < 128; i++) {
 		void *owner = tx->pe.memory + 0xc400 + i * 8;
 		u32 meta = get_unaligned_le32(owner + 4);
@@ -820,12 +858,29 @@ static bool rtl_ax_tx_key_pending(struct rtl_ax_tx *tx, unsigned int index)
 	return pending || rtl_ax_tx_pe_pending(tx, 0, IEEE80211_NUM_TIDS, index, true);
 }
 
+static void rtl_ax_tx_waiters(struct rtl_ax_tx *tx, int delta)
+{
+	unsigned long flags;
+	void *count;
+
+	if (!tx->pe_active) return;
+	count = tx->pe.memory + PE_PROBE_MAILBOX + 312;
+	spin_lock_irqsave(&tx->lock, flags);
+	put_unaligned_le32(get_unaligned_le32(count) + delta, count);
+	dma_wmb();
+	spin_unlock_irqrestore(&tx->lock, flags);
+}
+
 int rtl_ax_tx_flush_key(struct rtl_ax_tx *tx, unsigned int index)
 {
-	if (tx->pe_active) { put_unaligned_le32(1, tx->pe.memory + PE_PROBE_MAILBOX + 312); dma_wmb(); }
+	int ret;
+
+	rtl_ax_tx_waiters(tx, 1);
 	/* RPQ completion relinquishes the key before its CAM slot is reused. */
-	return wait_event_timeout(tx->key_flush_wait, !rtl_ax_tx_key_pending(tx, index),
+	ret = wait_event_timeout(tx->key_flush_wait, !rtl_ax_tx_key_pending(tx, index),
 		msecs_to_jiffies(1000)) ? 0 : -ETIMEDOUT;
+	rtl_ax_tx_waiters(tx, -1);
+	return ret;
 }
 
 bool rtl_ax_tx_station_pending(struct rtl_ax_tx *tx, unsigned int macid, unsigned int tid)
@@ -847,9 +902,13 @@ bool rtl_ax_tx_station_pending(struct rtl_ax_tx *tx, unsigned int macid, unsigne
 
 int rtl_ax_tx_wait_station(struct rtl_ax_tx *tx, unsigned int macid, unsigned int tid)
 {
-	if (tx->pe_active) { put_unaligned_le32(1, tx->pe.memory + PE_PROBE_MAILBOX + 312); dma_wmb(); }
-	return wait_event_timeout(tx->key_flush_wait, !rtl_ax_tx_station_pending(tx, macid, tid),
+	int ret;
+
+	rtl_ax_tx_waiters(tx, 1);
+	ret = wait_event_timeout(tx->key_flush_wait, !rtl_ax_tx_station_pending(tx, macid, tid),
 		msecs_to_jiffies(1000)) ? 0 : -ETIMEDOUT;
+	rtl_ax_tx_waiters(tx, -1);
+	return ret;
 }
 
 int rtl_ax_tx_free(struct rtl_ax_tx *tx, struct ieee80211_hw *hw)
