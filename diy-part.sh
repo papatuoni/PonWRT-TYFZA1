@@ -130,27 +130,80 @@ if [ "$DIY_SMARTDNS" = 1 ]; then
     SD_MK=feeds/packages/net/smartdns/Makefile
     [ -f "$SD_MK" ] || die "找不到 $SD_MK —— 请把本脚本放到 feeds update/install 之后执行"
 
-    # 官方 feed 这份 Makefile 是 46.1（tarball + PKG_HASH），
-    # 你的 custom-48.4 里那份用的是 git 协议 + rust，两者结构不同。
-    # 这里沿用官方 feed 的 Makefile（不碰 rust/webui 那一堆），
-    # 只把源码来源指向你的仓库，等价于 ImmortalWrt-Airoha 里的做法。
-    sed -i \
-        -e 's|^PKG_SOURCE:=.*|PKG_SOURCE:=$(PKG_NAME)-$(PKG_VERSION)-custom.tar.gz|' \
-        -e "s|^PKG_SOURCE_URL:=.*|PKG_SOURCE_URL:=https://codeload.github.com/${SMARTDNS_REPO}/tar.gz/${SMARTDNS_REF}?|" \
-        -e "s|^PKG_BUILD_DIR:=.*|PKG_BUILD_DIR:=\$(BUILD_DIR)/\$(PKG_NAME)-${SMARTDNS_REF}|" \
-        -e 's|^PKG_HASH:=.*|PKG_HASH:=skip|' \
-        -e 's|^PKG_MIRROR_HASH:=.*|PKG_MIRROR_HASH:=skip|' \
-        "$SD_MK"
+    # 改成 git 协议直接拉分支，不再走 codeload tarball。
+    # 理由：tarball 方案要同时猜对三件事——tarball 顶层目录名、PKG_BUILD_DIR、
+    # PKG_HASH，任何一个对不上都会编失败，而且报错全被 make 吞掉只剩一行
+    # "failed to build"。git 协议三个问题一次全消，也是 ImmortalWrt-Airoha
+    # 那边用的写法。整份 Makefile 重写，不 sed 官方那份（46.1 的结构与 48.x 不同）。
 
-    # 48.x 的 DEPENDS 带 libatomic，官方 46.1 那行没有，补上免得运行时缺符号
-    grep -q '+libatomic' "$SD_MK" ||
-        sed -i 's|^  DEPENDS:=+libpthread +libopenssl|& +libatomic|' "$SD_MK"
+    # 48.x 的 src/Makefile 会探测并 -latomic，46.1 那行 DEPENDS 没有，必须补
+    cat > "$SD_MK" <<EOF
+include \$(TOPDIR)/rules.mk
 
-    # 版本号仍是 feed 里的 46.1（只影响 smartdns -v 显示）；想跟着你的分支走，
-    # 在上面再加一行：sed -i 's|^PKG_VERSION:=.*|PKG_VERSION:=1.2025.46.2|' "$SD_MK"
-    info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}"
-    grep -E '^(PKG_SOURCE|PKG_SOURCE_URL|PKG_BUILD_DIR|PKG_HASH):=' "$SD_MK" | sed 's/^/    /'
-    force_pkg smartdns luci-app-smartdns
+PKG_NAME:=smartdns
+PKG_VERSION:=48.4
+PKG_RELEASE:=1
+
+# git 协议：直接跟分支，永远拿到分支 HEAD，不受 tag/tarball 命名影响
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/${SMARTDNS_REPO}.git
+PKG_SOURCE_VERSION:=${SMARTDNS_REF}
+PKG_MIRROR_HASH:=skip
+
+PKG_MAINTAINER:=Nick Peng <pymumu@gmail.com>
+PKG_LICENSE:=GPL-3.0-or-later
+PKG_LICENSE_FILES:=LICENSE
+
+PKG_BUILD_PARALLEL:=1
+
+include \$(INCLUDE_DIR)/package.mk
+
+MAKE_VARS += VER=\$(PKG_VERSION)
+MAKE_PATH:=src
+
+define Package/smartdns
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=smartdns server
+  SUBMENU:=IP Addresses and Names
+  DEPENDS:=+libpthread +libopenssl +libatomic
+  URL:=https://www.github.com/pymumu/smartdns/
+endef
+
+define Package/smartdns/description
+SmartDNS is a local DNS server which accepts DNS query requests from local network clients,
+gets DNS query results from multiple upstream DNS servers concurrently, and returns the fastest IP to clients.
+endef
+
+define Package/smartdns/conffiles
+/etc/config/smartdns
+/etc/smartdns/address.conf
+/etc/smartdns/blacklist-ip.conf
+/etc/smartdns/custom.conf
+/etc/smartdns/domain-block.list
+/etc/smartdns/domain-forwarding.list
+endef
+
+define Package/smartdns/install
+	\$(INSTALL_DIR) \$(1)/usr/sbin \$(1)/etc/config \$(1)/etc/init.d
+	\$(INSTALL_DIR) \$(1)/etc/smartdns \$(1)/etc/smartdns/domain-set \$(1)/etc/smartdns/conf.d/
+	\$(INSTALL_DIR) \$(1)/etc/smartdns/ip-set \$(1)/etc/smartdns/download
+	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/src/smartdns \$(1)/usr/sbin/smartdns
+	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/package/openwrt/files/etc/init.d/smartdns \$(1)/etc/init.d/smartdns
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/address.conf \$(1)/etc/smartdns/address.conf
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/blacklist-ip.conf \$(1)/etc/smartdns/blacklist-ip.conf
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/custom.conf \$(1)/etc/smartdns/custom.conf
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/domain-block.list \$(1)/etc/smartdns/domain-block.list
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/domain-forwarding.list \$(1)/etc/smartdns/domain-forwarding.list
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/files/etc/config/smartdns \$(1)/etc/config/smartdns
+endef
+
+\$(eval \$(call BuildPackage,smartdns))
+EOF
+
+    info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}（git 协议）"
+    grep -E '^(PKG_SOURCE_PROTO|PKG_SOURCE_URL|PKG_SOURCE_VERSION|PKG_MIRROR_HASH):=' "$SD_MK" | sed 's/^/    /'
+    force_pkg smartdns luci-app-smartdns libatomic
 fi
 
 # ------------------------------------------------------------ 4. OpenClash
