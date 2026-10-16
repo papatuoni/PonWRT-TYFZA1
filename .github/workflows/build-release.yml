@@ -152,16 +152,20 @@ jobs:
           # OpenWrt 默认 verbosity 会把子 make 的真实报错吞掉，只留一行
           # "ERROR: package/xxx failed to build."。这里把包名抠出来，单编它一次，
           # 用 V=s 把真正的 gcc / make 错误打到日志里。
-          cd sources/openwrt
+          #
+          # ⚠ build.log 在仓库根，不在 sources/openwrt 下 —— 用绝对路径，
+          #   否则就变成 "sed: can't read artifacts/build.log"。
+          LOG="$GITHUB_WORKSPACE/artifacts/build.log"
           PKG=$(sed -n 's/^[[:space:]]*ERROR: \(package\/[^ ]*\) failed to build\.$/\1/p' \
-               artifacts/build.log | head -1)
+                "$LOG" | head -1)
           if [ -z "$PKG" ]; then
-            echo "build.log 里没有捕获到失败包名，先看一下尾部："
-            tail -40 artifacts/build.log
-          else
-            echo "重编失败包: $PKG （V=s -j1，只编这一个，几分钟）"
-            make "$PKG/compile" V=s -j1 2>&1 | tail -150
+            echo "build.log 里没捕获到失败包名，看一眼尾部："
+            tail -40 "$LOG" 2>&1 || echo "（$LOG 也不存在）"
+            PKG="package/feeds/packages/smartdns"   # 兜底：目前已知唯一失败的包
           fi
+          echo "重编失败包: $PKG （V=s -j1，只编这一个）"
+          cd "$GITHUB_WORKSPACE/sources/openwrt"
+          make "$PKG/compile" V=s -j1 2>&1 | tail -200
       - name: 检查产物（诊断用）
         run: |
           cd sources/openwrt
