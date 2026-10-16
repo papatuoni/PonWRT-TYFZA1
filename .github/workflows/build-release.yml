@@ -62,6 +62,26 @@ jobs:
         with:
           path: sources/openwrt/dl
           key: openwrt-downloads-${{ runner.os }}-${{ hashFiles('port/sources.lock.json', 'configs/feeds.conf') }}
+
+      # ==================== 新增：执行自定义 DIY 脚本 ====================
+      - name: Run Custom DIY Script
+        run: |
+          if [ -f "diy-part.sh" ]; then
+            chmod +x diy-part.sh
+            cd sources/openwrt
+            ../../diy-part.sh
+          else
+            echo "diy-part.sh not found, skipping."
+          fi
+
+      # ==================== 新增：更新并安装新添加的 Feeds ====================
+      - name: Update & Install Feeds
+        run: |
+          cd sources/openwrt
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+      # ====================================================================
+
       - name: Obtain common runtime inputs and signing key
         env:
           FIT_SIGNING_KEY: ${{ secrets.TYFZA1_FIT_SIGNING_KEY }}
