@@ -18,6 +18,11 @@ on:
         description: 'Run diy-part.sh (1=yes, 0=skip)'
         required: false
         default: '1'
+      # 排查用：0 = 不换 smartdns 源码，用官方 feed 的 46.1 原版
+      diy_smartdns:
+        description: 'Use your smartdns fork (1=yes, 0=official 46.1)'
+        required: false
+        default: '1'
 
 permissions:
   contents: write
@@ -95,6 +100,7 @@ jobs:
       - name: Run Custom DIY Script
         env:
           DIY_ENABLE: ${{ inputs.diy_enable || '1' }}
+          DIY_SMARTDNS: ${{ inputs.diy_smartdns || '1' }}
         run: |
           if [ "$DIY_ENABLE" != "1" ]; then
             echo "diy_enable=$DIY_ENABLE，跳过 diy-part.sh"
@@ -140,6 +146,22 @@ jobs:
           set -o pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           sh port/scripts/build.sh sources/openwrt "$(nproc)" 2>&1 | tee artifacts/build.log
+      - name: 定位失败包（V=s 复现）
+        if: failure()
+        run: |
+          # OpenWrt 默认 verbosity 会把子 make 的真实报错吞掉，只留一行
+          # "ERROR: package/xxx failed to build."。这里把包名抠出来，单编它一次，
+          # 用 V=s 把真正的 gcc / make 错误打到日志里。
+          cd sources/openwrt
+          PKG=$(sed -n 's/^[[:space:]]*ERROR: \(package\/[^ ]*\) failed to build\.$/\1/p' \
+               artifacts/build.log | head -1)
+          if [ -z "$PKG" ]; then
+            echo "build.log 里没有捕获到失败包名，先看一下尾部："
+            tail -40 artifacts/build.log
+          else
+            echo "重编失败包: $PKG （V=s -j1，只编这一个，几分钟）"
+            make "$PKG/compile" V=s -j1 2>&1 | tail -150
+          fi
       - name: 检查产物（诊断用）
         run: |
           cd sources/openwrt
