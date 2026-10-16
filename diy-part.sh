@@ -71,6 +71,24 @@ if [ -n "$DIY_CONFIG" ]; then
 fi
 [ -s "$TREE/.config" ] || die ".config 为空，无法继续"
 
+# ---- 2-0. 强制锁定 target 与设备 ----------------------------------------
+# 这三行只要丢一条，defconfig 就选不到设备，target/linux install 会什么都不做、
+# 也不报错，一路走到打包那步才以 "cp: cannot stat ...-kernel.itb" 的形式爆出来。
+# 所以先删后写，确保唯一且存在。
+sed -i -e '/^CONFIG_TARGET_rtl9617c=/d' \
+       -e '/^CONFIG_TARGET_rtl9617c_generic=/d' \
+       -e '/^#\? *CONFIG_TARGET_rtl9617c_generic_DEVICE_/d' "$TREE/.config"
+printf '%s\n' \
+    'CONFIG_TARGET_rtl9617c=y' \
+    'CONFIG_TARGET_rtl9617c_generic=y' \
+    'CONFIG_TARGET_rtl9617c_generic_DEVICE_tianyi_tyfza1=y' >> "$TREE/.config"
+# 上游 boot.config 显式关掉了版本号进文件名。漏掉这行会 default y（因为
+# VERSIONOPT=y），镜像名变成 openwrt-0.3.1-alpha--rtl9617c-generic-...，
+# 中间那道多余的横线就是 IMG_PREFIX_EXTRA 在 EXTRA_IMAGE_NAME 为空时留下的。
+grep -q '^# CONFIG_VERSION_FILENAMES is not set$' "$TREE/.config" ||
+    printf '# CONFIG_VERSION_FILENAMES is not set\n' >> "$TREE/.config"
+info "已锁定 target/设备，并关闭 VERSION_FILENAMES"
+
 # 强制写进 .config：先删旧行再追加，避免出现两条互相矛盾的记录
 force_pkg() {
     local sym
