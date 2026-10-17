@@ -282,13 +282,18 @@ if [ "$DIY_ARGON" = 1 ]; then
 fi
 
 # ---------------------------------------------- 7. 可选：ddns-go（动态域名）
-# 官方两个 feed 里都没有它：packages 只有 ddns-scripts（配 luci-app-ddns 用的），
-# luci feed 里也只有 luci-app-ddns。用 sirpdboy 这个仓库，一个 clone 同时拿到
-# 本体和界面，且两份 Makefile 已写成绝对路径（$(TOPDIR)/feeds/...），开箱即用。
+# 官方两个 feed 里都没有它：packages 只有 ddns-scripts（那个是配 luci-app-ddns 用的），
+# luci feed 里也只有 luci-app-ddns。所以要么从 ImmortalWrt 搬两份，要么用 sirpdboy
+# 这个仓库 —— 后者更好：一个 clone 就同时拿到本体和界面，而且两份 Makefile 都已经
+# 写成绝对路径（$(TOPDIR)/feeds/...），开箱即用，不用像 ImmortalWrt 那样改 include。
 #
 #   sirpdboy/luci-app-ddns-go
 #     ├── ddns-go/           Go 守护进程本体（上游 jeessy2/ddns-go，6.17.1）
-#     └── luci-app-ddns-go/  LuCI 界面（JS 版，自带 po/zh_Hans）
+#     └── luci-app-ddns-go/  LuCI 界面（JS 版，兼容 24.10，自带 po/zh_Hans）
+#
+# 唯一要注意的：它依赖 feeds/packages/lang/golang/golang-package.mk 提供
+# GoBinPackage / GO_ARCH_DEPENDS。官方 packages feed 里确实有（golang 1.27），
+# 但 golang 属于 host 工具链，feeds 得先 update 过。
 if [ "$DIY_DDNSGO" = 1 ]; then
     DDNSGO_SRC="${DDNSGO_SRC:-https://github.com/sirpdboy/luci-app-ddns-go.git}"
     rm -rf /tmp/sirpdboy-ddnsgo
@@ -313,19 +318,39 @@ if [ "$DIY_DDNSGO" = 1 ]; then
     sed -i 's|include ../../luci.mk|include $(TOPDIR)/feeds/luci/luci.mk|' \
         package/luci-app-ddns-go/Makefile
 
+    # ===== 关键：必须把 golang 宿主工具链装进源码树 =====
+    # ddns-go 的 Makefile 有 PKG_BUILD_DEPENDS:=golang/host。
+    # 但 build.sh 里的 prepare_luci_feeds.sh 只装 .config 里 CONFIG_PACKAGE_*=[ym]
+    # 列出的包（外加 cgi-io/luasrcdiet/luci），golang 不在其中，于是：
+    #   WARNING: Makefile 'package/ddns-go/Makefile' has a build dependency
+    #            on 'golang/host', which does not exist
+    # 这个 WARNING 不致命，make 会照常往下跑，直到 go 命令找不到才失败 ——
+    # 表现就是 V=s 日志里 PATH 指向 staging_dir/hostpkg/lib/go-1.27/bin
+    # 但那个目录压根没生成。
+    # 依赖链必须三层都装上，缺一不可：
+    #   golang/host        → HOST_BUILD_DEPENDS:=golang1.27/host
+    #   golang1.27/host    → HOST_BUILD_DEPENDS:=golang-bootstrap/host
+    # （GO_BOOTSTRAP_VERSION:=bootstrap，由 golang1.27/Makefile 第 13 行定义）
+    ./scripts/feeds install golang golang1.27 golang-bootstrap
+    for p in golang golang1.27 golang-bootstrap; do
+        [ -e "package/feeds/packages/lang/golang/$p" ] ||
+            warn "feeds install 后仍找不到 lang/golang/$p，golang/host 可能装不全"
+    done
+
     rm -rf /tmp/sirpdboy-ddnsgo
-    # rpcd-mod-ucode 必须显式勾上：这个界面是 JS/ucode 版，ubus 后端是
-    # root/usr/share/rpcd/ucode/luci.ddns-go，只有装了 rpcd-mod-ucode 才会被加载。
-    # sirpdboy 的 LUCI_DEPENDS 只写了 +ddns-go，不会自动带它。缺了界面能开，
-    # 但读不到配置、启停不了服务。包几十 KB。
+    # rpcd-mod-ucode 必须显式勾上：这个 LuCI 界面是 JS/ucode 版，
+    # 它把 ubus 后端实现放在 root/usr/share/rpcd/ucode/luci.ddns-go（ucode 脚本）。
+    # 该目录只有装了 rpcd-mod-ucode 才会被 rpcd 加载；sirpdboy 的 Makefile 里
+    # LUCI_DEPENDS 只写了 +ddns-go，不会自动带上它。缺了这个包，界面能打开但
+    # 所有 ubus 调用失败 —— 读不到配置、也启停不了服务。包很小，几十 KB。
     force_pkg ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn ca-bundle rpcd-mod-ucode
     info "ddns-go $(sed -n 's/^PKG_VERSION:=//p' package/ddns-go/Makefile) + " \
          "luci-app-ddns-go $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-ddns-go/Makefile) 已就位"
-    warn "ddns-go 需要编 Go 宿主工具链（golang/host），可能要多花 20~40 分钟"
-    warn "Go 程序约 8~12 MB；rootfs 上限 32.09 MiB，当前已用约 19 MB，超了先砍 ruby"
+    warn "ddns-go 需要编 Go 宿主工具链（golang/host），这一步很慢，可能要多花 20~40 分钟"
+    warn "Go 程序体积不小（约 8~12 MB）；rootfs 上限 32.09 MiB，当前已用约 19 MB，超了先砍 ruby"
 fi
 
-# ------------------------------------------------------------------ 7. 收尾
+# ------------------------------------------------------------------ 8. 收尾
 info "diy-part.sh 完成。接下来 build.sh 会执行 prepare_luci_feeds -> make defconfig"
 cat <<'EOF'
 
