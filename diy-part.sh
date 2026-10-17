@@ -28,6 +28,7 @@ DIY_TURBOACC="${DIY_TURBOACC:-1}"
 DIY_OPENCLASH="${DIY_OPENCLASH:-1}"
 DIY_SMARTDNS="${DIY_SMARTDNS:-1}"
 DIY_ARGON="${DIY_ARGON:-0}"
+DIY_DDNSGO="${DIY_DDNSGO:-0}"
 
 # 你的 smartdns 分支：改这里就能换源码，不用动 workflow
 SMARTDNS_REPO="${SMARTDNS_REPO:-papatuoni/smartdns}"
@@ -278,6 +279,50 @@ if [ "$DIY_ARGON" = 1 ]; then
     done
     force_pkg luci-theme-argon luci-app-argon-config
     info "argon 主题已装载"
+fi
+
+# ---------------------------------------------- 7. 可选：ddns-go（动态域名）
+# 官方两个 feed 里都没有它：packages 只有 ddns-scripts（配 luci-app-ddns 用的），
+# luci feed 里也只有 luci-app-ddns。用 sirpdboy 这个仓库，一个 clone 同时拿到
+# 本体和界面，且两份 Makefile 已写成绝对路径（$(TOPDIR)/feeds/...），开箱即用。
+#
+#   sirpdboy/luci-app-ddns-go
+#     ├── ddns-go/           Go 守护进程本体（上游 jeessy2/ddns-go，6.17.1）
+#     └── luci-app-ddns-go/  LuCI 界面（JS 版，自带 po/zh_Hans）
+if [ "$DIY_DDNSGO" = 1 ]; then
+    DDNSGO_SRC="${DDNSGO_SRC:-https://github.com/sirpdboy/luci-app-ddns-go.git}"
+    rm -rf /tmp/sirpdboy-ddnsgo
+    git clone --depth 1 "$DDNSGO_SRC" /tmp/sirpdboy-ddnsgo >/dev/null 2>&1 ||
+        die "克隆 $DDNSGO_SRC 失败"
+
+    # --- 本体 ---
+    rm -rf package/ddns-go
+    [ -f /tmp/sirpdboy-ddnsgo/ddns-go/Makefile ] ||
+        die "仓库里找不到 ddns-go/Makefile，上游目录结构变了"
+    cp -r /tmp/sirpdboy-ddnsgo/ddns-go package/ddns-go
+
+    # --- LuCI 界面 ---
+    rm -rf package/luci-app-ddns-go
+    [ -f /tmp/sirpdboy-ddnsgo/luci-app-ddns-go/Makefile ] ||
+        die "仓库里找不到 luci-app-ddns-go/Makefile，上游目录结构变了"
+    cp -r /tmp/sirpdboy-ddnsgo/luci-app-ddns-go package/luci-app-ddns-go
+
+    # 保险：sirpdboy 现在写的是绝对路径，万一哪天改回相对路径，这里兜住
+    sed -i 's|include ../../lang/golang/golang-package.mk|include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk|' \
+        package/ddns-go/Makefile
+    sed -i 's|include ../../luci.mk|include $(TOPDIR)/feeds/luci/luci.mk|' \
+        package/luci-app-ddns-go/Makefile
+
+    rm -rf /tmp/sirpdboy-ddnsgo
+    # rpcd-mod-ucode 必须显式勾上：这个界面是 JS/ucode 版，ubus 后端是
+    # root/usr/share/rpcd/ucode/luci.ddns-go，只有装了 rpcd-mod-ucode 才会被加载。
+    # sirpdboy 的 LUCI_DEPENDS 只写了 +ddns-go，不会自动带它。缺了界面能开，
+    # 但读不到配置、启停不了服务。包几十 KB。
+    force_pkg ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn ca-bundle rpcd-mod-ucode
+    info "ddns-go $(sed -n 's/^PKG_VERSION:=//p' package/ddns-go/Makefile) + " \
+         "luci-app-ddns-go $(sed -n 's/^PKG_VERSION:=//p' package/luci-app-ddns-go/Makefile) 已就位"
+    warn "ddns-go 需要编 Go 宿主工具链（golang/host），可能要多花 20~40 分钟"
+    warn "Go 程序约 8~12 MB；rootfs 上限 32.09 MiB，当前已用约 19 MB，超了先砍 ruby"
 fi
 
 # ------------------------------------------------------------------ 7. 收尾
