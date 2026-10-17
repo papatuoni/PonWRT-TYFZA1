@@ -1726,7 +1726,7 @@ static int rtl_ax_receive_configure(struct rtl_ax_ap *radio, unsigned int primar
 	if (!channel_changed) goto resume;
 	ret = radio->chip == RTL_AX_8852C ?
 		rtl_ax_c_receive_channel(&radio->io, &radio->phy, &radio->bb_dm, primary, channel, bandwidth, &radio->channel) :
-		rtl_ax_xb_receive_channel20(&radio->io, &radio->phy, &radio->bb_dm, channel, &radio->channel);
+		rtl_ax_xb_receive_channel(&radio->io, &radio->phy, &radio->bb_dm, primary, channel, bandwidth, &radio->channel);
 	if (!ret && radio->chip == RTL_AX_8852C)
 		rtl_ax_c_dig_bandwidth(&radio->io, &radio->dig, bandwidth);
 	if (!ret)
@@ -1750,7 +1750,7 @@ static int rtl_ax_receive_configure(struct rtl_ax_ap *radio, unsigned int primar
 	}
 	if (!ret) {
 		if (radio->chip == RTL_AX_8192XB)
-			ret = rtl_ax_xb_iqk_start20(&radio->io, channel, &radio->xb_iqk);
+			ret = rtl_ax_xb_iqk_start(&radio->io, channel, bandwidth, &radio->xb_iqk);
 		else
 			ret = rtl_ax_c_iqk_start(&radio->io, channel, radio->channel.bandwidth, &radio->c_iqk);
 	}
@@ -1972,9 +1972,9 @@ static ssize_t radio_iqk_show(struct device *dev,
 		}
 		goto unlock;
 	}
-	length = sysfs_emit(buffer, "IQK=%s chip=%02x method=host normal_SCC_2G_20 channel=%u "
+	length = sysfs_emit(buffer, "IQK=%s chip=%02x method=host normal_SCC_2G_%u channel=%u "
 		"times=%u failures=%u status=%08x\n",
-		state->ready ? "applied" : "pending", radio->chip, state->channel,
+		state->ready ? "applied" : "pending", radio->chip, 20U << state->bandwidth, state->channel,
 		state->times, state->failures, state->status);
 	for (path = 0; path < 2; path++) {
 		length += sysfs_emit_at(buffer, length, "path=%u shots=%u LOK_range_fail=%u TX_fail=%u RX_fail=%u "
@@ -2592,11 +2592,12 @@ static const struct attribute_group rtl_ax_group = {
 };
 static const struct attribute_group *rtl_ax_groups[] = { &rtl_ax_group, NULL };
 
-static void rtl_ax_led_set(struct tyfza1_led *led, bool on)
+static int rtl_ax_led_set(struct tyfza1_led *led, unsigned int on)
 {
 	struct rtl_ax_ap *radio = container_of(led, struct rtl_ax_ap, led);
 
 	rtl_ax_led_output(&radio->io, on);
+	return 0;
 }
 
 static void rtl_ax_stop(struct rtl_ax_ap *radio)
@@ -2762,6 +2763,7 @@ static int rtl_ax_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		goto stop;
 	rtl_ax_led_init(&radio->io);
 	radio->led.output = rtl_ax_led_set;
+	radio->led.cdev.max_brightness = 1;
 	radio->led.cdev.name = radio->chip == RTL_AX_8852C ? "LED_WLAN_5G" : "LED_WLAN_2G";
 	radio->led.cdev.default_trigger = ieee80211_get_radio_led_name(radio->hw);
 	ret = tyfza1_led_register(&pdev->dev, &radio->led, NULL);
