@@ -12,22 +12,19 @@ on:
         description: Optional repository path to a custom OpenWrt config
         required: false
         default: ''
-      # 新增：不填就用 diy-part.sh 里 DIY_CONFIG 指定的那份
-      #       （默认 configs/tyfza1-diy.config），想临时关掉自定义就填 0
+      # ↓↓↓ 以下三个为自定义编译开关 ↓↓↓
       diy_enable:
         description: 'Run diy-part.sh (1=yes, 0=skip)'
         required: false
         default: '1'
-      # 排查用：0 = 不换 smartdns 源码，用官方 feed 的 46.1 原版
       diy_smartdns:
         description: 'Use your smartdns fork (1=yes, 0=official 46.1)'
         required: false
         default: '1'
-        
-      diy_ddnsgo:
-        description: 'Add ddns-go (1=yes, 0=no; needs golang/host, slow)'
+      diy_ddns:
+        description: 'Add ddns-scripts + luci-app-ddns (1=yes, 0=no)'
         required: false
-        default: '0'
+        default: '1'
 
 permissions:
   contents: write
@@ -65,15 +62,15 @@ jobs:
           fi
       - name: Prepare release notes
         env:
-          DIY_DDNSGO: ${{ inputs.diy_ddnsgo || '0' }}
+          DIY_DDNS: ${{ inputs.diy_ddns || '1' }}
+          DIY_SMARTDNS: ${{ inputs.diy_smartdns || '1' }}
         run: |
           python3 scripts/test_release_notes.py
-          # 上游新增的 scripts/release_notes.py 要求 RELEASE_NOTES.md 里必须存在
+          # 上游的 scripts/release_notes.py 要求 RELEASE_NOTES.md 里必须存在
           # 一个 "## <tag>" 小节且内容非空，否则 exit 2：
           #   error: Expected exactly one changelog section for v0.6.0-diy1; found 0
-          # 自建固件的 tag（v0.6.0-diy1）上游 RELEASE_NOTES.md 里没有对应小节，
-          # 于是整个 job 在这一步（编译开始前）就挂掉。
-          # 这里兜底：提取失败就自己生成一份，保证后面 gh release create 有文件可用，
+          # 自建固件的 tag（如 v0.6.0-diy1）上游 RELEASE_NOTES.md 里没有对应小节，
+          # 于是整个 job 在这一步（编译开始前）就挂掉。这里兜底自动生成，
           # 以后换任何 tag 都不用再去改 RELEASE_NOTES.md。
           if ! python3 scripts/release_notes.py "$RELEASE_TAG" \
                 > "$RUNNER_TEMP/release-notes.md" 2>/tmp/rn.err; then
@@ -86,11 +83,11 @@ jobs:
               echo
               echo "### 本版包含"
               echo
-              echo "- smartdns：papatuoni/smartdns @ custom-48.4"
+              echo "- 默认 LAN IP：192.168.2.1"
+              [ "$DIY_SMARTDNS" = 1 ] && echo "- smartdns：papatuoni/smartdns @ custom-48.4"
               echo "- OpenClash：vernesong/OpenClash"
               echo "- TurboACC：BBR + flow offload + fullcone（不带 SFE）"
-              echo "- 默认 LAN IP：192.168.2.1"
-              [ "$DIY_DDNSGO" = 1 ] && echo "- ddns-go + luci-app-ddns-go（sirpdboy）"
+              [ "$DIY_DDNS" = 1 ] && echo "- 动态 DNS：ddns-scripts + luci-app-ddns + Cloudflare 扩展"
               echo
               echo "刷机方法与已知问题见仓库 README；上游变更见 RELEASE_NOTES.md。"
             } > "$RUNNER_TEMP/release-notes.md"
@@ -117,34 +114,26 @@ jobs:
           path: sources/openwrt/dl
           key: openwrt-downloads-${{ runner.os }}-${{ hashFiles('port/sources.lock.json', 'configs/feeds.conf') }}
 
-      # ==================== 更新 Feeds（只 update，绝不能 install -a）====================
-      # 顺序：必须在 DIY 之前。diy-part.sh 要改 feeds/packages/net/smartdns/Makefile，
-      # update 之后这个文件就存在了（feeds/packages/ 是 update 拉下来的源码树），
-      # 不需要 install —— install 只是在 package/feeds/ 建符号链接。
+      # ==================== 新增：更新 Feeds（必须在 DIY 之前）====================
+      # diy-part.sh 要改 feeds/packages/net/smartdns/Makefile 换掉 smartdns 源码，
+      # 也要 feeds install ddns-scripts / luci-app-ddns，feeds 没 update 就找不到。
       #
-      # ⚠ 这里原来是 install -a，这正是上次编译失败的根因：
-      #   树里此时没有 feeds.conf，scripts/feeds 会回退到 feeds.conf.default，
-      #   把 routing / telephony / video 一起装进来。其中 qt5base、weechat、
-      #   squeezelite 存在循环 Kconfig 依赖，于是：
-      #       error: recursive dependency detected!
-      #   make defconfig 直接 abort，make world 压根没跑，所以最后打包时
-      #   cp: cannot stat ...-kernel.itb —— 真实错误被埋在前面几十兆日志里。
-      #   项目自己的做法（scripts/prepare_luci_feeds.sh）是只装 .config 里列出的包，
-      #   那些有问题的包压根不会进 package/feeds，也就不会被 defconfig 扫描到。
+      # ⚠ 只能用项目锁定的 feeds.conf（packages + luci），且只 update 不 install -a：
+      #   树里此时还没有 feeds.conf，scripts/feeds 会回退到 feeds.conf.default，
+      #   把 routing / telephony / video 一起装进来，其中 qt5base、weechat、
+      #   squeezelite 有循环 Kconfig 依赖，会让 make defconfig 直接 abort。
       - name: Update Feeds
         run: |
           cd sources/openwrt
-          # 用项目锁定的 feeds.conf（只有 packages + luci），
-          # 否则会按 feeds.conf.default 把 5 个 feed 全 clone 一遍，白花时间
           cp ../../configs/feeds.conf feeds.conf
           ./scripts/feeds update -a
 
-      # ==================== 执行自定义 DIY 脚本 ====================
+      # ==================== 新增：执行自定义 DIY 脚本 ====================
       - name: Run Custom DIY Script
         env:
           DIY_ENABLE: ${{ inputs.diy_enable || '1' }}
           DIY_SMARTDNS: ${{ inputs.diy_smartdns || '1' }}
-          DIY_DDNSGO: ${{ inputs.diy_ddnsgo || '0' }}
+          DIY_DDNS: ${{ inputs.diy_ddns || '1' }}
         run: |
           if [ "$DIY_ENABLE" != "1" ]; then
             echo "diy_enable=$DIY_ENABLE，跳过 diy-part.sh"
@@ -153,7 +142,7 @@ jobs:
             cd sources/openwrt
             ../../diy-part.sh
           else
-            echo "diy-part.sh not found, skipping."
+            echo "::warning::diy-part.sh not found, skipping."
           fi
 
       - name: Obtain common runtime inputs and signing key
@@ -180,55 +169,38 @@ jobs:
         env:
           TYFZA1_RUNTIME_INPUTS: ${{ github.workspace }}/artifacts/runtime-inputs
           TYFZA1_SIGNING_KEYS: ${{ github.workspace }}/artifacts/signing
-          # 留空：.config 由 diy-part.sh 写好；sync-overlay.sh 见到
-          # 非空 .config 就不会再覆盖它。要临时换配置才在这里填路径。
           TYFZA1_CONFIG: ${{ inputs.config_file }}
         run: |
-          # 关键：没有 pipefail 时，管道的退出码取最后一个命令 tee 的返回值（恒为 0），
-          # make world 失败也会被判成成功，一路走到打包那步才以 "cp: cannot stat
+          # 关键：没有 pipefail 时，管道退出码取最后一个命令 tee 的（恒为 0），
+          # make world 失败也会被判成成功，一路走到打包才以 "cp: cannot stat
           # ...-kernel.itb" 的形式爆出来，真实错误被埋在前面几十兆日志里。
           set -o pipefail
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           sh port/scripts/build.sh sources/openwrt "$(nproc)" 2>&1 | tee artifacts/build.log
+
+      # ==================== 新增：失败时自动 V=s 复现真实报错 ====================
       - name: 定位失败包（V=s 复现）
         if: failure()
         run: |
-          # OpenWrt 默认 verbosity 会把子 make 的真实报错吞掉，只留一行
-          # "ERROR: package/xxx failed to build."。这里把包名抠出来，单编它一次，
-          # 用 V=s 把真正的 gcc / make 错误打到日志里。
-          #
-          # ⚠ build.log 在仓库根，不在 sources/openwrt 下 —— 用绝对路径，
-          #   否则就变成 "sed: can't read artifacts/build.log"。
+          # build.log 在仓库根，不在 sources/openwrt 下 —— 必须用绝对路径。
           LOG="$GITHUB_WORKSPACE/artifacts/build.log"
           PKG=$(sed -n 's/^[[:space:]]*ERROR: \(package\/[^ ]*\) failed to build\.$/\1/p' \
                 "$LOG" | head -1)
           if [ -z "$PKG" ]; then
             echo "build.log 里没捕获到失败包名，看一眼尾部："
             tail -40 "$LOG" 2>&1 || echo "（$LOG 也不存在）"
-            PKG="package/feeds/packages/smartdns"   # 兜底：目前已知唯一失败的包
+            exit 0
           fi
           echo "重编失败包: $PKG （V=s -j1，只编这一个）"
           cd "$GITHUB_WORKSPACE/sources/openwrt"
           make "$PKG/compile" V=s -j1 2>&1 | tail -200
-      - name: 检查产物（诊断用）
+
+      # ==================== 新增：对齐镜像命名 ====================
+      # scripts/package_release.sh 把镜像名写死成 openwrt--rtl9617c-generic-...，
+      # 而 IMG_PREFIX 会随 CONFIG_VERSION_FILENAMES / VERSION_CODE_FILENAMES 变化，
+      # 名字对不上就会 cp: cannot stat ...-kernel.itb。这里按实际文件名建硬链接兜底。
+      - name: 对齐镜像命名
         run: |
-          cd sources/openwrt
-          echo "===== .config 里的 target / 设备 / 版本符号 ====="
-          grep -E "CONFIG_TARGET_|CONFIG_VERSION(FILENAMES|OPT|_NUMBER|CODE)?\b" .config || true
-          echo "===== bin/targets/rtl9617c/generic/ ====="
-          ls -la bin/targets/rtl9617c/generic/ 2>&1 || echo "（目录不存在）"
-          echo "===== bin 下所有 itb / squashfs / sysupgrade ====="
-          find bin -maxdepth 6 \( -name "*.itb" -o -name "*.squashfs" -o -name "*sysupgrade*" \) \
-            -printf '%p  %s bytes\n' 2>/dev/null | head -30 || echo "（一个都没有）"
-          echo "===== defconfig 后设备符号是否还在 ====="
-          grep -c "^CONFIG_TARGET_rtl9617c_generic_DEVICE_tianyi_tyfza1=y" .config ||
-            echo "设备符号已丢失 —— 这就是没有 kernel.itb 的原因"
-      - name: 对齐镜像命名（免疫 package_release.sh 的硬编码）
-        run: |
-          # scripts/package_release.sh 把镜像名写死成 openwrt--rtl9617c-generic-...，
-          # 而 IMG_PREFIX 会随 CONFIG_VERSION_FILENAMES / VERSION_CODE_FILENAMES
-          # 变化。上面已关掉这两个开关，这里再兜一层底：按实际文件名建硬链接，
-          # 保证不管名字里多出哪一段，打包脚本都能 cp 到。
           cd sources/openwrt/bin/targets/rtl9617c/generic || exit 0
           n=0
           for f in openwrt-*-rtl9617c-generic-tianyi_tyfza1-*; do
@@ -237,8 +209,9 @@ jobs:
             tgt="openwrt--rtl9617c-generic-tianyi_tyfza1-${rest}"
             [ -e "$tgt" ] || { ln -f "$f" "$tgt"; n=$((n+1)); }
           done
-          echo "已补建 $n 个对齐链接："
+          echo "已补建 $n 个对齐链接"
           ls -la openwrt--rtl9617c-generic-tianyi_tyfza1-* 2>/dev/null || echo "（无）"
+
       - name: Package sysupgrade and factory telnet installer
         run: |
           sh scripts/package_release.sh sources/openwrt artifacts/release
@@ -254,6 +227,14 @@ jobs:
           retention-days: 14
       - name: Publish release
         run: |
+          set -x
+          echo "RELEASE_TAG=$RELEASE_TAG  REPO=$GITHUB_REPOSITORY"
+          ls -la artifacts/release/ || { echo "打包产物目录不存在，前面某步失败了"; exit 1; }
+          # 保险：万一上面生成 release-notes 那步没跑（比如 tag 触发且 step 被改过），
+          # 这里再兜一次，避免 gh release create 因缺文件而退出。
+          [ -s "$RUNNER_TEMP/release-notes.md" ] || \
+            printf '# %s\n\nTYFZA1 firmware build.\n' "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --target "$(git rev-parse HEAD)" \
@@ -267,3 +248,8 @@ jobs:
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease \
             --title "$RELEASE_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
+
+          echo "===== 发布完成，核对用 ====="
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json tagName,isDraft,isPrerelease,url --jq \
+            '"tag=\(.tagName) draft=\(.isDraft) prerelease=\(.isPrerelease)\nURL: \(.url)"'
