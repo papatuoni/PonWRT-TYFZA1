@@ -23,6 +23,11 @@ on:
         description: 'Use your smartdns fork (1=yes, 0=official 46.1)'
         required: false
         default: '1'
+        
+      diy_ddnsgo:
+        description: 'Add ddns-go (1=yes, 0=no; needs golang/host, slow)'
+        required: false
+        default: '0'
 
 permissions:
   contents: write
@@ -101,6 +106,7 @@ jobs:
         env:
           DIY_ENABLE: ${{ inputs.diy_enable || '1' }}
           DIY_SMARTDNS: ${{ inputs.diy_smartdns || '1' }}
+          DIY_DDNSGO: ${{ inputs.diy_ddnsgo || '0' }}
         run: |
           if [ "$DIY_ENABLE" != "1" ]; then
             echo "diy_enable=$DIY_ENABLE，跳过 diy-part.sh"
