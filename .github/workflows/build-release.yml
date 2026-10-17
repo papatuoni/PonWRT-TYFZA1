@@ -64,9 +64,39 @@ jobs:
             fi
           fi
       - name: Prepare release notes
+        env:
+          DIY_DDNSGO: ${{ inputs.diy_ddnsgo || '0' }}
         run: |
           python3 scripts/test_release_notes.py
-          python3 scripts/release_notes.py "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
+          # 上游新增的 scripts/release_notes.py 要求 RELEASE_NOTES.md 里必须存在
+          # 一个 "## <tag>" 小节且内容非空，否则 exit 2：
+          #   error: Expected exactly one changelog section for v0.6.0-diy1; found 0
+          # 自建固件的 tag（v0.6.0-diy1）上游 RELEASE_NOTES.md 里没有对应小节，
+          # 于是整个 job 在这一步（编译开始前）就挂掉。
+          # 这里兜底：提取失败就自己生成一份，保证后面 gh release create 有文件可用，
+          # 以后换任何 tag 都不用再去改 RELEASE_NOTES.md。
+          if ! python3 scripts/release_notes.py "$RELEASE_TAG" \
+                > "$RUNNER_TEMP/release-notes.md" 2>/tmp/rn.err; then
+            echo "::warning::RELEASE_NOTES.md 里没有 $RELEASE_TAG 的小节，改用自动生成的说明"
+            cat /tmp/rn.err
+            {
+              echo "## $RELEASE_TAG"
+              echo
+              echo "自建固件（DIY build），基于 PonWRT-TYFZA1 官方源码编译。"
+              echo
+              echo "### 本版包含"
+              echo
+              echo "- smartdns：papatuoni/smartdns @ custom-48.4"
+              echo "- OpenClash：vernesong/OpenClash"
+              echo "- TurboACC：BBR + flow offload + fullcone（不带 SFE）"
+              echo "- 默认 LAN IP：192.168.2.1"
+              [ "$DIY_DDNSGO" = 1 ] && echo "- ddns-go + luci-app-ddns-go（sirpdboy）"
+              echo
+              echo "刷机方法与已知问题见仓库 README；上游变更见 RELEASE_NOTES.md。"
+            } > "$RUNNER_TEMP/release-notes.md"
+          fi
+          echo "===== 本次 Release 说明 ====="
+          cat "$RUNNER_TEMP/release-notes.md"
       - name: Install build dependencies
         run: |
           sudo apt-get update
