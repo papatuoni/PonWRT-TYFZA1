@@ -14,7 +14,7 @@
 
 extern int rtl9617c_ni_fe_setup_tc(struct device *, struct net_device *, enum tc_setup_type, void *);
 
-static char *lan = "eth1", *ap = "ap5";
+static char *lan = "lan2", *ap = "ap5";
 static char *lan_ip = "192.0.2.83", *wifi_ip = "192.0.2.88";
 static char *lan_mac = "02:00:00:00:00:01", *wifi_mac = "02:00:00:00:00:02";
 module_param(lan, charp, 0400);
