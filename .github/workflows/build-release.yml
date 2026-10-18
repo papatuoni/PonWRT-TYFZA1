@@ -49,7 +49,7 @@ jobs:
         run: |
           case "$RELEASE_TAG" in
             v*) ;;
-            *) echo "::error::Release tag must start with v (for example, v0.6.0-alpha)."; exit 1 ;;
+            *) echo "::error::Release tag must start with v (for example, v0.8.0-beta)."; exit 1 ;;
           esac
           git check-ref-format "refs/tags/$RELEASE_TAG"
           if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
@@ -60,6 +60,10 @@ jobs:
               exit 1
             fi
           fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $RELEASE_TAG already exists. Use a new tag to preserve the published firmware."
+            exit 1
+          fi
       - name: Prepare release notes
         env:
           DIY_DDNS: ${{ inputs.diy_ddns || '1' }}
@@ -68,8 +72,8 @@ jobs:
           python3 scripts/test_release_notes.py
           # 上游的 scripts/release_notes.py 要求 RELEASE_NOTES.md 里必须存在
           # 一个 "## <tag>" 小节且内容非空，否则 exit 2：
-          #   error: Expected exactly one changelog section for v0.6.0-diy1; found 0
-          # 自建固件的 tag（如 v0.6.0-diy1）上游 RELEASE_NOTES.md 里没有对应小节，
+          #   error: Expected exactly one changelog section for v0.8.0-diy1; found 0
+          # 自建固件的 tag（如 v0.8.0-diy1）上游 RELEASE_NOTES.md 里没有对应小节，
           # 于是整个 job 在这一步（编译开始前）就挂掉。这里兜底自动生成，
           # 以后换任何 tag 都不用再去改 RELEASE_NOTES.md。
           if ! python3 scripts/release_notes.py "$RELEASE_TAG" \
@@ -97,11 +101,13 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang-18 llvm-18 lld-18 flex bison gawk \
+          sudo apt-get install -y build-essential busybox clang-18 llvm-18 lld-18 flex bison gawk \
             gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync unzip \
             zlib1g-dev file wget curl device-tree-compiler u-boot-tools swig \
             libelf-dev python3-pyelftools python3-dev libfuse-dev pkgconf
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+      - name: Verify storage migration
+        run: python3 scripts/test_ubi_storage.py
       - name: Obtain locked OpenWrt source
         run: sh port/scripts/prepare.sh sources/openwrt
       - name: Prepare OMCI compiler
@@ -179,21 +185,31 @@ jobs:
           sh port/scripts/build.sh sources/openwrt "$(nproc)" 2>&1 | tee artifacts/build.log
 
       # ==================== 新增：失败时自动 V=s 复现真实报错 ====================
-      - name: 定位失败包（V=s 复现）
+      - name: 定位失败点（V=s 复现）
         if: failure()
         run: |
           # build.log 在仓库根，不在 sources/openwrt 下 —— 必须用绝对路径。
           LOG="$GITHUB_WORKSPACE/artifacts/build.log"
-          PKG=$(sed -n 's/^[[:space:]]*ERROR: \(package\/[^ ]*\) failed to build\.$/\1/p' \
-                "$LOG" | head -1)
-          if [ -z "$PKG" ]; then
-            echo "build.log 里没捕获到失败包名，看一眼尾部："
-            tail -40 "$LOG" 2>&1 || echo "（$LOG 也不存在）"
+
+          echo "===== runner 磁盘剩余（内核编挂最常见原因是 ENOSPC）====="
+          df -h "$GITHUB_WORKSPACE" 2>/dev/null || df -h
+          echo "===== build_dir / staging_dir / dl 占用 ====="
+          du -sh sources/openwrt/build_dir sources/openwrt/staging_dir \
+                sources/openwrt/dl 2>/dev/null
+
+          # 失败的可能是包，也可能是 target/linux（内核）或 toolchain。
+          # 旧版只匹配 package/...，遇到 "ERROR: target/linux failed to build."
+          # 就抓不到，只会打印一句"没捕获到失败包名"。
+          TARGET=$(sed -n 's/^[[:space:]]*ERROR: \([^ ]*\) failed to build\.$/\1/p' \
+                   "$LOG" | tail -1)
+          if [ -z "$TARGET" ]; then
+            echo "build.log 里没捕获到失败目标，看一眼尾部："
+            tail -60 "$LOG" 2>&1 || echo "（$LOG 也不存在）"
             exit 0
           fi
-          echo "重编失败包: $PKG （V=s -j1，只编这一个）"
+          echo "重编失败目标: $TARGET （V=s -j1，只编这一个）"
           cd "$GITHUB_WORKSPACE/sources/openwrt"
-          make "$PKG/compile" V=s -j1 2>&1 | tail -200
+          make "$TARGET/compile" V=s -j1 2>&1 | tail -250
 
       # ==================== 新增：对齐镜像命名 ====================
       # scripts/package_release.sh 把镜像名写死成 openwrt--rtl9617c-generic-...，
@@ -212,7 +228,7 @@ jobs:
           echo "已补建 $n 个对齐链接"
           ls -la openwrt--rtl9617c-generic-tianyi_tyfza1-* 2>/dev/null || echo "（无）"
 
-      - name: Package sysupgrade and factory telnet installer
+      - name: Package firmware and installer
         run: |
           sh scripts/package_release.sh sources/openwrt artifacts/release
           git archive --format=tar.gz --prefix=PonWRT-TYFZA1/ HEAD \
@@ -238,18 +254,19 @@ jobs:
           if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
               --target "$(git rev-parse HEAD)" \
-              --title "$RELEASE_TAG" --prerelease --draft \
+              --title "$RELEASE_TAG" --draft \
               --notes-file "$RUNNER_TEMP/release-notes.md"
           fi
           gh release upload "$RELEASE_TAG" artifacts/release/sysupgrade.bin \
             artifacts/release/tyfza1-telnet-install.tar.gz artifacts/release/SHA256SUMS \
             artifacts/release/COPYING artifacts/release/PonWRT-TYFZA1-source.tar.gz \
             --repo "$GITHUB_REPOSITORY" --clobber
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease \
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease=false --latest \
             --title "$RELEASE_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
 
           echo "===== 发布完成，核对用 ====="
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json tagName,isDraft,isPrerelease,url --jq \
-            '"tag=\(.tagName) draft=\(.isDraft) prerelease=\(.isPrerelease)\nURL: \(.url)"'
+            --json tagName,isDraft,isLatest,url --jq \
+            '"tag=\(.tagName) draft=\(.isDraft) latest=\(.isLatest)\nURL: \(.url)"'
