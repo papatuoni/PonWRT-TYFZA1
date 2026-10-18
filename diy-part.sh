@@ -97,6 +97,31 @@ for sym in CONFIG_VERSION_FILENAMES CONFIG_VERSION_CODE_FILENAMES; do
 done
 info "已锁定 target/设备，并关闭版本号进文件名（VERNUM + VERCODE）"
 
+# ---- 2-1. 补齐上游漏掉的内核符号 ----------------------------------------
+# 上游 v0.8.0 新增了补丁 port/overlay/.../patches-6.18/209-native-leds.patch，
+# 引入了一个 tristate 符号：
+#     config LEDS_TRIGGER_TYFZA1_USB
+#         tristate "TYFZA1 USB presence and activity LED"
+#         depends on ARCH_RTL9617C && USB && LEDS_TRIGGERS
+# 但同一个提交没有把它写进 target/linux/rtl9617c/config-6.18
+# （那份配置里只有 CONFIG_LEDS_TYFZA1=y，没有 USB 这个）。
+# 于是内核 kconfig 认为这是一个 NEW 且可见的符号，需要交互确认；CI 里没有
+# 终端，syncconfig 直接失败：
+#     TYFZA1 USB presence and activity LED (LEDS_TRIGGER_TYFZA1_USB) [N/m/?] (NEW)
+#     make[7]: *** [scripts/kconfig/Makefile:85: syncconfig] Error 1
+#     ERROR: target/linux failed to build.
+# 这发生在编内核的第一步，后面什么都没开始，所以日志里看不到任何 gcc 输出。
+#
+# 填 n 是安全的：Kconfig 里它的默认值就是 N，且 port/configs/tyfza1-compat.config
+# 并不要求 kmod-tyfza1-usb-led，所以没有任何包依赖它为 y/m。
+KC=target/linux/rtl9617c/config-6.18
+if [ -f "$KC" ] && ! grep -q 'CONFIG_LEDS_TRIGGER_TYFZA1_USB' "$KC"; then
+    printf '# CONFIG_LEDS_TRIGGER_TYFZA1_USB is not set\n' >> "$KC"
+    info "补齐内核符号：CONFIG_LEDS_TRIGGER_TYFZA1_USB=n（上游 v0.8.0 漏配）"
+elif [ ! -f "$KC" ]; then
+    warn "没找到 $KC，跳过内核符号补齐（overlay 可能没同步）"
+fi
+
 # 强制写进 .config：先删旧行再追加，避免出现两条互相矛盾的记录
 force_pkg() {
     local sym
