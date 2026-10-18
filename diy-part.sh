@@ -223,6 +223,44 @@ EOF
     info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}（git 协议）"
     grep -E '^(PKG_SOURCE_PROTO|PKG_SOURCE_URL|PKG_SOURCE_VERSION|PKG_MIRROR_HASH):=' "$SD_MK" | sed 's/^/    /'
     force_pkg smartdns luci-app-smartdns zlib
+
+    # ===== 关键：必须同步新版 LuCI 界面，否则功能"看得见编不出来" =====
+    # feeds/luci 里的 luci-app-smartdns 版本是 1.2023.42（2023 年，界面 1177 行），
+    # 而你的 smartdns 是 48.4。老界面不认识 48.x 新增的配置项，于是即使后端
+    # 二进制确实是你的 48.4，网页上也渲染不出那些功能 —— 典型就是服务器组、
+    # 备用 DNS 相关的选项缺失。
+    #
+    # 你的分支自带新版界面：package/luci/files/root/www/.../smartdns.js（1685 行，
+    # 比 feeds 那份多约 500 行）。它没有 OpenWrt 的 Makefile（那个目录是给 debian
+    # 打包用的），所以不能当独立包，只能把 js 覆盖到 feeds 的老包上。
+    # ACL 我比对过，两份完全一致，不用动。
+    LUCI_JS=feeds/luci/applications/luci-app-smartdns/htdocs/luci-static/resources/view/smartdns/smartdns.js
+    if [ ! -f "$LUCI_JS" ]; then
+        warn "找不到 $LUCI_JS，跳过界面同步（luci-app-smartdns 可能没装）"
+    else
+        # 用 codeload 拉 tarball，不用 git clone --sparse：
+        # 后者在受限网络里会撞 GitHub 403，而 codeload 的下载走的是同一条
+        # 已被验证可用的链路（Makefile 的 git 协议下载也是 OpenWrt 自己处理）。
+        rm -rf /tmp/smartdns-luci && mkdir -p /tmp/smartdns-luci
+        curl -fsSL --retry 2 --max-time 120 \
+            "https://codeload.github.com/${SMARTDNS_REPO}/tar.gz/${SMARTDNS_REF}" \
+            | tar -xz -C /tmp/smartdns-luci --strip-components=1 2>/dev/null
+        NEW_JS=/tmp/smartdns-luci/package/luci/files/root/www/luci-static/resources/view/smartdns/smartdns.js
+        if [ -f "$NEW_JS" ]; then
+            cp "$NEW_JS" "$LUCI_JS"
+            info "LuCI 界面已同步为分支自带的新版（$(wc -l < "$LUCI_JS") 行，feeds 原版 1177 行）"
+        else
+            warn "分支里没有 package/luci/.../smartdns.js，沿用 feeds 老界面"
+        fi
+        # 中文翻译也一并同步，避免新字段显示成英文原文
+        NEW_PO=/tmp/smartdns-luci/package/luci/files/luci/i18n/smartdns.zh-cn.po
+        PO_DIR=feeds/luci/applications/luci-app-smartdns/po
+        if [ -f "$NEW_PO" ] && [ -d "$PO_DIR/zh_Hans" ]; then
+            cp "$NEW_PO" "$PO_DIR/zh_Hans/smartdns.po"
+            info "已同步中文翻译（$(grep -c msgid "$NEW_PO") 条）"
+        fi
+        rm -rf /tmp/smartdns-luci
+    fi
 fi
 
 # ------------------------------------------------------------ 4. OpenClash
