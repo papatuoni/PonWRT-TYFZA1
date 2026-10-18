@@ -35,7 +35,7 @@ else
     setenv tyfza1_block /dev/ubiblock0_4
 fi
 setenv bootargs "earlycon console=ttyS0,115200n8 clk_ignore_unused maxcpus=4 ubi.mtd=ubi_device ubi.block=0,${tyfza1_root} root=${tyfza1_block} rootfstype=squashfs ro tyfza1.slot=${tyfza1_slot}"
-''' + board_boot_command())
+''' + 'bootm ${unzip_src}#conf-0\n')
 (out / 'image.its').write_text(make_its(0x200000, 0x200000, 0x2000000,
                                       signed=True, board_variants=True))
 # OpenWrt's staging mkimage has TOOLS_LIBCRYPTO disabled. Use the signer
