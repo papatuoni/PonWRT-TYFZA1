@@ -29,10 +29,26 @@ DIY_OPENCLASH="${DIY_OPENCLASH:-1}"
 DIY_SMARTDNS="${DIY_SMARTDNS:-1}"
 DIY_ARGON="${DIY_ARGON:-0}"
 DIY_DDNS="${DIY_DDNS:-0}"
+# smartdns Web 仪表盘（Rust 插件 smartdns_ui.so + 前端 wwwroot）。
+# 编译成本高（Rust 依赖多），默认关；确认基线没问题后再开。
+DIY_SMARTDNS_UI="${DIY_SMARTDNS_UI:-0}"
 
 # 你的 smartdns 分支：改这里就能换源码，不用动 workflow
 SMARTDNS_REPO="${SMARTDNS_REPO:-papatuoni/smartdns}"
 SMARTDNS_REF="${SMARTDNS_REF:-custom-48.4}"
+
+# ImmortalWrt 源（ddns-go / luci-app-ddns-go 从这里取）
+IMM_PKGS_REPO="${IMM_PKGS_REPO:-immortalwrt/packages}"
+IMM_PKGS_REF="${IMM_PKGS_REF:-master}"     # 建议改成固定 commit，避免漂移
+IMM_LUCI_REPO="${IMM_LUCI_REPO:-immortalwrt/luci}"
+IMM_LUCI_REF="${IMM_LUCI_REF:-master}"     # 同上
+
+# smartdns 官方 Web 前端静态资源（不含在 smartdns 源码树里，单独发布）
+SMARTDNS_WEBUI_REPO="${SMARTDNS_WEBUI_REPO:-pymumu/smartdns-webui}"
+SMARTDNS_WEBUI_TAG="${SMARTDNS_WEBUI_TAG:-v1.0.0}"
+SMARTDNS_WEBUI_URL="${SMARTDNS_WEBUI_URL:-https://github.com/pymumu/smartdns-webui/releases/download/v1.0.0/smartdns-ui-v1.0.0.tar.gz}"
+# ↑ 仅作备用参考：ImmortalWrt 的方案是 git clone smartdns-webui 源码后
+#   本地 npm install && npm run build，不走 release 直链（直链经常 403）。
 
 # 仓库里维护的 .config（相对仓库根）。留空则不覆盖，沿用树里已有的 .config
 DIY_CONFIG="${DIY_CONFIG:-configs/tyfza1-diy.config}"
@@ -180,91 +196,99 @@ if [ "$DIY_SMARTDNS" = 1 ]; then
     SD_MK=feeds/packages/net/smartdns/Makefile
     [ -f "$SD_MK" ] || die "找不到 $SD_MK —— 请把本脚本放到 feeds update/install 之后执行"
 
-    # 改成 git 协议直接拉分支，不再走 codeload tarball。
-    # 理由：tarball 方案要同时猜对三件事——tarball 顶层目录名、PKG_BUILD_DIR、
-    # PKG_HASH，任何一个对不上都会编失败，而且报错全被 make 吞掉只剩一行
-    # "failed to build"。git 协议三个问题一次全消，也是 ImmortalWrt-Airoha
-    # 那边用的写法。整份 Makefile 重写，不 sed 官方那份（46.1 的结构与 48.x 不同）。
+    # ===== 用 ImmortalWrt 的 net/smartdns/Makefile 作为基础 =====
+    # 它比 feeds 官方那份（46.1）和之前手写版都完善，关键是把 Web 仪表盘做成了
+    # 独立子包 smartdns-ui：
+    #   - 不开启时完全不占空间（DEPENDS: +smartdns，独立 ipk）
+    #   - 前端从 pymumu/smartdns-webui.git 拉源码，本地 npm install && npm run build，
+    #     产物 out/ 装到 /usr/share/smartdns/wwwroot
+    #     （比直接下载 release 的 tar.gz 稳——release 直链经常 403）
+    #   - Rust 后端走标准 rust-package.mk，BINDGEN_EXTRA_CLANG_ARGS 已用
+    #     --sysroot=$(TOOLCHAIN_ROOT_DIR) 处理好，不用自己猜
+    #   - MAKE_VARS 带 WITH_ZLIB=0，规避之前踩过的 "missing libz.so.1" 打包失败
+    rm -rf /tmp/imm-sd && mkdir -p /tmp/imm-sd
+    curl -fsSL --retry 2 --max-time 180 \
+        "https://codeload.github.com/${IMM_PKGS_REPO}/tar.gz/${IMM_PKGS_REF}" \
+        | tar -xz -C /tmp/imm-sd --strip-components=1 \
+              --wildcards "*/net/smartdns/*" 2>/dev/null
+    if [ ! -f /tmp/imm-sd/net/smartdns/Makefile ]; then
+        die "从 ImmortalWrt 取 net/smartdns 失败"
+    fi
+    cp /tmp/imm-sd/net/smartdns/Makefile "$SD_MK"
+    rm -rf /tmp/imm-sd
 
-    # DEPENDS 需要显式带上 +zlib。
-    # src/Makefile 的 WITH_ZLIB 默认是 auto：探测到 host 有 zlib 就加 -DWITH_ZLIB
-    # 并链接 -lz。于是二进制 NEEDED 里有 libz.so.1，而官方 46.1 那份 Makefile 的
-    # DEPENDS 只有 libpthread/libopenssl，打包 apk 时 OpenWrt 找不到 libz.so.1
-    # 的提供者，直接报：
-    #   Package smartdns is missing dependencies for the following libraries: libz.so.1
-    # 注意失败发生在"打 apk"这一步，不是编译——所以 src/smartdns 其实已经编出来了，
-    # 日志里能看到 install 到 ipkg 的全过程，很容易被误导成编译问题。
-    #
-    # 另外别加 +libatomic：src/Makefile 里的 -latomic 只在 USE_ATOMIC 探测失败时才加，
-    # 而 aarch64 上 __atomic_* 是编译器内联的，探测必然通过；凭空加一个树里可能
-    # 不存在的 DEPENDS，反而会让 defconfig 把 smartdns 整包静默丢掉。
-    cat > "$SD_MK" <<EOF
-include \$(TOPDIR)/rules.mk
+    # --- 改造 1：源码改成你的分支（git 协议）---
+    # 原本是 codeload tarball + PKG_HASH，要同时猜对顶层目录名 / PKG_BUILD_DIR /
+    # PKG_HASH，任一不对就编失败、且报错被 make 吞掉只剩一行。git 协议三个问题全消。
+    sed -i \
+        -e '/^PKG_SOURCE:=/d' \
+        -e '/^PKG_SOURCE_URL:=/d' \
+        -e '/^PKG_HASH:=/d' \
+        -e '/^PKG_BUILD_DIR:=/d' \
+        "$SD_MK"
 
-PKG_NAME:=smartdns
-PKG_VERSION:=48.4
-PKG_RELEASE:=1
+    # --- 改造 2：include 路径改绝对路径 ---
+    # 放 feeds/packages 下时，相对路径 ../../lang/rust/... 够不着
+    sed -i 's|include ../../lang/rust/rust-package.mk|include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk|' "$SD_MK"
+    sed -i 's|include ../../lang/rust/rust-host-build.mk|include $(TOPDIR)/feeds/packages/lang/rust/rust-host-build.mk|' "$SD_MK"
 
-# git 协议：直接跟分支，永远拿到分支 HEAD，不受 tag/tarball 命名影响
-PKG_SOURCE_PROTO:=git
-PKG_SOURCE_URL:=https://github.com/${SMARTDNS_REPO}.git
-PKG_SOURCE_VERSION:=${SMARTDNS_REF}
-PKG_MIRROR_HASH:=skip
+    # PKG_LICENSE_FILES 之后插入 git 协议四行
+    awk -v repo="$SMARTDNS_REPO" -v ref="$SMARTDNS_REF" '
+      { print }
+      /^PKG_LICENSE_FILES:=/ && !done {
+        print ""
+        print "# git 协议：直接跟分支，永远拿到分支 HEAD，不受 tag/tarball 命名影响"
+        print "PKG_SOURCE_PROTO:=git"
+        print "PKG_SOURCE_URL:=https://github.com/" repo ".git"
+        print "PKG_SOURCE_VERSION:=" ref
+        print "PKG_MIRROR_HASH:=skip"
+        done=1
+      }' "$SD_MK" > "$SD_MK.new" && mv "$SD_MK.new" "$SD_MK"
 
-PKG_MAINTAINER:=Nick Peng <pymumu@gmail.com>
-PKG_LICENSE:=GPL-3.0-or-later
-PKG_LICENSE_FILES:=LICENSE
+    # --- 改造 3：aarch64 不需要 i386 的 libatomic，去掉避免误加依赖 ---
+    sed -i 's|^  DEPENDS:=+i386:libatomic +libopenssl|  DEPENDS:=+libopenssl|' "$SD_MK"
 
-PKG_BUILD_PARALLEL:=1
-
-include \$(INCLUDE_DIR)/package.mk
-
-MAKE_VARS += VER=\$(PKG_VERSION)
-MAKE_PATH:=src
-
-define Package/smartdns
-  SECTION:=net
-  CATEGORY:=Network
-  TITLE:=smartdns server
-  SUBMENU:=IP Addresses and Names
-  DEPENDS:=+libpthread +libopenssl +zlib
-  URL:=https://www.github.com/pymumu/smartdns/
-endef
-
-define Package/smartdns/description
-SmartDNS is a local DNS server which accepts DNS query requests from local network clients,
-gets DNS query results from multiple upstream DNS servers concurrently, and returns the fastest IP to clients.
-endef
-
-define Package/smartdns/conffiles
-/etc/config/smartdns
-/etc/smartdns/address.conf
-/etc/smartdns/blacklist-ip.conf
-/etc/smartdns/custom.conf
-/etc/smartdns/domain-block.list
-/etc/smartdns/domain-forwarding.list
-endef
-
-define Package/smartdns/install
-	\$(INSTALL_DIR) \$(1)/usr/sbin \$(1)/etc/config \$(1)/etc/init.d
-	\$(INSTALL_DIR) \$(1)/etc/smartdns \$(1)/etc/smartdns/domain-set \$(1)/etc/smartdns/conf.d/
-	\$(INSTALL_DIR) \$(1)/etc/smartdns/ip-set \$(1)/etc/smartdns/download
-	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/src/smartdns \$(1)/usr/sbin/smartdns
-	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/package/openwrt/files/etc/init.d/smartdns \$(1)/etc/init.d/smartdns
-	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/address.conf \$(1)/etc/smartdns/address.conf
-	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/blacklist-ip.conf \$(1)/etc/smartdns/blacklist-ip.conf
-	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/custom.conf \$(1)/etc/smartdns/custom.conf
-	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/domain-block.list \$(1)/etc/smartdns/domain-block.list
-	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/domain-forwarding.list \$(1)/etc/smartdns/domain-forwarding.list
-	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/files/etc/config/smartdns \$(1)/etc/config/smartdns
-endef
-
-\$(eval \$(call BuildPackage,smartdns))
-EOF
-
-    info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}（git 协议）"
+    info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}（git 协议，基于 ImmortalWrt Makefile）"
     grep -E '^(PKG_SOURCE_PROTO|PKG_SOURCE_URL|PKG_SOURCE_VERSION|PKG_MIRROR_HASH):=' "$SD_MK" | sed 's/^/    /'
-    force_pkg smartdns luci-app-smartdns zlib
+    force_pkg smartdns luci-app-smartdns
+
+    # ===== 可选：Web 仪表盘（独立包 smartdns-ui）=====
+    # 后端 .so 是 Rust 的（plugin/smartdns-ui），前端是 npm 构建的静态页面。
+    # 官方配置：plugin smartdns_ui.so + smartdns-ui.www-root /usr/share/smartdns/wwwroot
+    # 默认账号密码 admin/password，监听 6080。
+    if [ "$DIY_SMARTDNS_UI" = 1 ]; then
+        # rust-bindgen 不在本项目锁定的 feeds 里（只有 lang/rust、lang/node），
+        # 而 ImmortalWrt 的 Makefile 声明了 PACKAGE_smartdns-ui:rust-bindgen/host。
+        # 不装的话只留一条不致命 WARNING，然后 cargo build 时 bindgen 找不到才真失败。
+        rm -rf /tmp/imm-bg && mkdir -p /tmp/imm-bg
+        curl -fsSL --retry 2 --max-time 180 \
+            "https://codeload.github.com/${IMM_PKGS_REPO}/tar.gz/${IMM_PKGS_REF}" \
+            | tar -xz -C /tmp/imm-bg --strip-components=1 \
+                  --wildcards "*/devel/rust-bindgen/*" 2>/dev/null
+        if [ -f /tmp/imm-bg/devel/rust-bindgen/Makefile ]; then
+            mkdir -p package/tyfza1-extra/devel
+            rm -rf package/tyfza1-extra/devel/rust-bindgen
+            cp -r /tmp/imm-bg/devel/rust-bindgen package/tyfza1-extra/devel/
+            sed -i 's|include ../../lang/rust/rust-host-build.mk|include $(TOPDIR)/feeds/packages/lang/rust/rust-host-build.mk|' \
+                package/tyfza1-extra/devel/rust-bindgen/Makefile
+            info "已补 rust-bindgen（feeds 里没有，从 ImmortalWrt 取）"
+        else
+            warn "取 rust-bindgen 失败，smartdns-ui 可能因缺 bindgen 编不过"
+        fi
+        rm -rf /tmp/imm-bg
+
+        # node/host、rust/host 也要显式装进源码树（prepare_luci_feeds.sh 不会装）
+        ./scripts/feeds install node rust 2>/dev/null || true
+        for p in node rust; do
+            [ -e "package/feeds/packages/lang/$p" ] ||
+                warn "feeds install 后仍找不到 lang/$p，node/host 或 rust/host 可能缺失"
+        done
+
+        force_pkg smartdns-ui
+        info "smartdns-ui（Web 仪表盘）已启用：前端 npm 构建 + Rust 后端"
+        warn "这一步很慢：要编 node/host、rust/host、bindgen，再 npm build + cargo build"
+        warn "可能额外 30~60 分钟；失败就把 V=s 的报错发我"
+    fi
 
     # ===== 关键：必须用 ImmortalWrt 那份界面，否则"故障转移/备用服务器"出不来 =====
     # 三个来源实测对比（行数 / fallback 开关）：
@@ -369,26 +393,73 @@ if [ "$DIY_ARGON" = 1 ]; then
     info "argon 主题已装载"
 fi
 
-# ---------------------------------------------- 7. 可选：动态域名（DDNS）
-# 用官方 feeds 的 ddns-scripts + luci-app-ddns，不用 ddns-go。
-# 理由：rootfs 上限 32.09 MiB，刷完机可用空间只剩约 11 MiB；ddns-go 的 Go 二进制
-# 8~12 MB 会吃掉几乎全部余量，还要编 40~60 分钟 Go 工具链。ddns-scripts 全套几百 KB，
-# 且默认 10 分钟轮询 + hotplug 网口事件即时触发，IP 未变化还不发请求，功能完全够用。
+# ---------------------------------------------- 7. 可选：动态域名（ddns-go）
+# 用 ImmortalWrt 的 ddns-go + luci-app-ddns-go，不再用 ddns-scripts。
 #
-# 包名与依赖（对应本项目锁定的 feeds 版本，均已核实）：
-#   ddns-scripts               DEPENDS: +ddns-scripts-services +resolveip +ip
-#   ddns-scripts-cloudflare    DEPENDS:  ddns-scripts +curl   （TITLE: Extension for cloudflare.com API v4）
-#   luci-app-ddns              LUCI_DEPENDS: +luci-base +ddns-scripts +ucode-mod-math
+# 换回来的原因：v0.8.0 改了存储布局（RELEASE_NOTES: "修复可写空间固定为 16 MiB…
+# 实机确认可写空间扩大"）。刷机日志里能看到 ubi_apps 卷有 793 LEBs ≈ 94 MiB
+# （ubi0:10 挂载成功），不再是之前那个 32 MiB rootfs / 11 MiB 可用的窘境。
+# 所以之前"为了省空间只能用 ddns-scripts"的理由已经不成立。
+# ddns-go 是 Go 写的，自带 Web 配置界面，支持 Cloudflare / 阿里云 / Dnspod /
+# 华为云 / Callback 等十余家，比 ddns-scripts 好用得多。
+#
+# 包名与依赖（ImmortalWrt，均已核实）：
+#   ddns-go          6.17.6  DEPENDS: $(GO_ARCH_DEPENDS) +ca-bundle
+#                            PKG_BUILD_DEPENDS: golang/host   ← 关键，见下
+#   luci-app-ddns-go         LUCI_DEPENDS: +ddns-go
 if [ "$DIY_DDNS" = 1 ]; then
-    # 必须显式 feeds install：prepare_luci_feeds.sh 只装 .config 里 CONFIG_PACKAGE_*=[ym]
-    # 列出的包，而这里的开关是在 defconfig 之后才写入 .config 的，不手动装就找不到。
-    ./scripts/feeds install ddns-scripts ddns-scripts-cloudflare luci-app-ddns ucode-mod-math
+    # ===== 关键：golang 宿主工具链必须显式装进源码树 =====
+    # ddns-go 的 Makefile 有 PKG_BUILD_DEPENDS:=golang/host。
+    # 但 prepare_luci_feeds.sh 只装 .config 里 CONFIG_PACKAGE_*=[ym] 列出的包，
+    # golang 不在其中，于是会留下一条不致命的 WARNING：
+    #   WARNING: Makefile 'package/ddns-go/Makefile' has a build dependency
+    #            on 'golang/host', which does not exist
+    # make 会照常往下跑，直到 go 命令找不到才失败（PATH 里有
+    # staging_dir/hostpkg/lib/go-1.27/bin，但那个目录压根没生成）。
+    # 依赖链三层，缺一不可（scripts/feeds install 不处理 HOST_BUILD_DEPENDS）：
+    #   golang/host     → golang1.27/host → golang-bootstrap/host
+    ./scripts/feeds install golang golang1.27 golang-bootstrap
+    for p in golang golang1.27 golang-bootstrap; do
+        [ -e "package/feeds/packages/lang/golang/$p" ] ||
+            warn "feeds install 后仍找不到 lang/golang/$p，golang/host 可能装不全"
+    done
 
-    force_pkg ddns-scripts ddns-scripts-cloudflare luci-app-ddns \
-              luci-i18n-ddns-zh-cn curl resolveip ucode-mod-math
-    info "DDNS（ddns-scripts + luci-app-ddns + cloudflare 扩展）已就位"
-    echo "     刷机后：服务 → 动态 DNS。PPPoE 场景公网 IPv6 常在 LAN 口，"
-    echo "     ip_network 可能需要填 br-lan 而不是 wan6（先 ip -6 addr show 确认）。"
+    # --- 本体（ImmortalWrt packages）---
+    rm -rf package/ddns-go /tmp/imm-ddnsgo
+    mkdir -p /tmp/imm-ddnsgo
+    curl -fsSL --retry 2 --max-time 180 \
+        "https://codeload.github.com/${IMM_PKGS_REPO}/tar.gz/${IMM_PKGS_REF}" \
+        | tar -xz -C /tmp/imm-ddnsgo --strip-components=1 \
+              --wildcards "*/net/ddns-go/*" 2>/dev/null
+    if [ -f /tmp/imm-ddnsgo/net/ddns-go/Makefile ]; then
+        cp -r /tmp/imm-ddnsgo/net/ddns-go package/ddns-go
+    else
+        die "从 ImmortalWrt 取 net/ddns-go 失败"
+    fi
+
+    # --- LuCI 界面（ImmortalWrt luci）---
+    rm -rf package/luci-app-ddns-go /tmp/imm-luci-dg
+    mkdir -p /tmp/imm-luci-dg
+    curl -fsSL --retry 2 --max-time 300 \
+        "https://codeload.github.com/${IMM_LUCI_REPO}/tar.gz/${IMM_LUCI_REF}" \
+        | tar -xz -C /tmp/imm-luci-dg --strip-components=1 \
+              --wildcards "*/applications/luci-app-ddns-go/*" 2>/dev/null
+    if [ -f /tmp/imm-luci-dg/applications/luci-app-ddns-go/Makefile ]; then
+        cp -r /tmp/imm-luci-dg/applications/luci-app-ddns-go package/luci-app-ddns-go
+    else
+        die "从 ImmortalWrt 取 applications/luci-app-ddns-go 失败"
+    fi
+    rm -rf /tmp/imm-ddnsgo /tmp/imm-luci-dg
+
+    # 两份 Makefile 都写的是相对路径，放 package/ 下够不着，必须改成绝对路径
+    sed -i 's|include ../../lang/golang/golang-package.mk|include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk|' \
+        package/ddns-go/Makefile
+    sed -i 's|include ../../luci.mk|include $(TOPDIR)/feeds/luci/luci.mk|' \
+        package/luci-app-ddns-go/Makefile
+
+    force_pkg ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn ca-bundle
+    info "ddns-go $(sed -n 's/^PKG_VERSION:=//p' package/ddns-go/Makefile) + luci-app-ddns-go 已就位"
+    warn "ddns-go 需要编 Go 宿主工具链（golang/host），这一步很慢，可能多花 20~40 分钟"
 fi
 
 # ------------------------------------------------------------------ 8. 收尾
@@ -399,7 +470,10 @@ cat <<'EOF'
   1) 源码树里不存在的包，make defconfig 会静默丢行、不报错。
      编完去 artifacts/build.log / bin/packages 核对 luci-app-openclash、
      luci-app-smartdns、luci-app-turboacc 是否真的编出来了。
-  2) rootfs.squashfs 硬上限 33648640 字节（约 32.09 MiB，原厂 UBI 卷大小），
-     超了会在打包镜像那一步直接失败（port/overlay/.../image/Makefile）。
+  2) rootfs.squashfs 仍有硬上限 33648640 字节（约 32.09 MiB，原厂 rootfs 卷大小），
+     超了会在打包镜像那一步失败（port/overlay/.../image/Makefile）。
      OpenClash 带的 ruby 是体积大头，超了先砍它，再砍 fullcone。
+  3) 但【可写空间】已不再是 11 MiB：v0.8.0 改了存储布局，刷机日志里
+     ubi_apps 卷有 793 LEBs ≈ 94 MiB（ubi0:10）。所以 ddns-go（Go，8~12 MB）
+     这类体积不再是不可接受的——这也是本版把 ddns-scripts 换回 ddns-go 的原因。
 EOF
