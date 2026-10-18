@@ -39,7 +39,7 @@ on:
       diy_smartdns_ui:
         description: 'smartdns Web dashboard (Rust plugin, slow, 1=yes)'
         required: false
-        default: '0'
+        default: '1'
 
 permissions:
   contents: write
