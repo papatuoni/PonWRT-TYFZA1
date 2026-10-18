@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+#
+# ============================================================================
+#  PonWRT-TYFZA1 · diy-part.sh
+#  天翼 TYFZA1 / Realtek RTL9617CVW —— 自定义编译步骤
+#
+#  执行时机（见 .github/workflows/build-release.yml）：
+#      cd sources/openwrt && ../../diy-part.sh
+#  所以本脚本运行时：
+#      当前目录 = sources/openwrt（OpenWrt 源码树根）
+#      仓库根   = ../..
+#
+#  ⚠ 必须排在 "feeds update -a && feeds install -a" 之后执行
+#    第 4 步换 smartdns 源码，改的是 feeds/packages/net/smartdns/Makefile，
+#    feeds 没装就找不到这个文件。这也是对原 workflow 唯一需要的改动。
+#
+#  开关（在 workflow 里用 env 覆盖，或本地 export）：
+#    DIY_TURBOACC=1  装载 chenmozhijin/turboacc（会替换 firewall4/nftables/libnftnl）
+#    DIY_OPENCLASH=1 装载 vernesong/OpenClash
+#    DIY_SMARTDNS=1  把 smartdns 源码换成 papatuoni/smartdns 的 custom-48.4
+#    DIY_ARGON=0     可选主题（官方 luci feed 里没有 argon，需要第三方源码）
+#    DIY_LAN_IP=192.168.2.1
+# ============================================================================
+set -eu
+
+DIY_LAN_IP="${DIY_LAN_IP:-192.168.2.1}"
+DIY_TURBOACC="${DIY_TURBOACC:-1}"
+DIY_OPENCLASH="${DIY_OPENCLASH:-1}"
+DIY_SMARTDNS="${DIY_SMARTDNS:-1}"
+DIY_ARGON="${DIY_ARGON:-0}"
+DIY_DDNS="${DIY_DDNS:-0}"
+
+# 你的 smartdns 分支：改这里就能换源码，不用动 workflow
+SMARTDNS_REPO="${SMARTDNS_REPO:-papatuoni/smartdns}"
+SMARTDNS_REF="${SMARTDNS_REF:-custom-48.4}"
+
+# 仓库里维护的 .config（相对仓库根）。留空则不覆盖，沿用树里已有的 .config
+DIY_CONFIG="${DIY_CONFIG:-configs/tyfza1-diy.config}"
+
+TREE="$(pwd)"
+REPO_ROOT="$(cd "$TREE/../.." && pwd)"
+
+info() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33m警告:\033[0m %s\n' "$*" >&2; }
+die()  { printf '\033[1;31m错误:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- 0. 环境自检
+[ -f include/version.mk ] && [ -d package ] ||
+    die "当前目录不是 OpenWrt 源码树（$(pwd)）。本脚本要由 workflow 在 sources/openwrt 下执行"
+info "源码树 $TREE"
+info "仓库根 $REPO_ROOT"
+
+# ---------------------------------------------------------- 1. 改默认 LAN IP
+# 该机型的 board.d/02_network 只 ucidef_set_interfaces_lan_wan，不写 IP，
+# 所以 192.168.1.1 来自 config_generate，改这一个文件就够。
+CFG_GEN=package/base-files/files/bin/config_generate
+if [ -f "$CFG_GEN" ]; then
+    before="$(grep -c '192\.168\.1\.1' "$CFG_GEN" || true)"
+    sed -i "s/192\.168\.1\.1/${DIY_LAN_IP}/g" "$CFG_GEN"
+    info "默认 LAN IP：192.168.1.1 -> ${DIY_LAN_IP}（config_generate 命中 ${before} 处）"
+else
+    warn "没找到 $CFG_GEN，跳过改 IP（OpenWrt 目录结构变了？）"
+fi
+
+# ------------------------------------------------------------- 2. 写入 .config
+# sync-overlay.sh 的逻辑：填了 config_file 就用它；没填且树里 .config 非空
+# 就保留。所以这里写好 .config 后，workflow 的 config_file 留空即可。
+if [ -n "$DIY_CONFIG" ]; then
+    [ -f "$REPO_ROOT/$DIY_CONFIG" ] || die "找不到配置 $REPO_ROOT/$DIY_CONFIG"
+    cp "$REPO_ROOT/$DIY_CONFIG" "$TREE/.config"
+    info "已写入配置 $DIY_CONFIG"
+fi
+[ -s "$TREE/.config" ] || die ".config 为空，无法继续"
+
+# ---- 2-0. 强制锁定 target 与设备 ----------------------------------------
+# 这三行只要丢一条，defconfig 就选不到设备，target/linux install 会什么都不做、
+# 也不报错，一路走到打包那步才以 "cp: cannot stat ...-kernel.itb" 的形式爆出来。
+# 所以先删后写，确保唯一且存在。
+sed -i -e '/^CONFIG_TARGET_rtl9617c=/d' \
+       -e '/^CONFIG_TARGET_rtl9617c_generic=/d' \
+       -e '/^#\? *CONFIG_TARGET_rtl9617c_generic_DEVICE_/d' "$TREE/.config"
+printf '%s\n' \
+    'CONFIG_TARGET_rtl9617c=y' \
+    'CONFIG_TARGET_rtl9617c_generic=y' \
+    'CONFIG_TARGET_rtl9617c_generic_DEVICE_tianyi_tyfza1=y' >> "$TREE/.config"
+# 版本号绝不能进文件名。scripts/package_release.sh 把镜像名写死成
+#   openwrt--rtl9617c-generic-tianyi_tyfza1-kernel.itb
+# （注意 openwrt 后那道双横线：VERNUM 和 VERCODE 都为空，只剩 EXTRA 的那一道）。
+# 而这两个符号在 VERSIONOPT=y 时默认是 y，于是名字里被塞进一段版本号：
+#   CONFIG_VERSION_FILENAMES=y       -> openwrt-0.4.1-alpha--rtl9617c-generic-...
+#   CONFIG_VERSION_CODE_FILENAMES=y  -> openwrt-r0-79bc56c-rtl9617c-generic-...
+# 结果打包时 cp: cannot stat ...-kernel.itb —— 实际上镜像早就编好了，
+# 只是名字对不上。两个都必须显式关掉。
+for sym in CONFIG_VERSION_FILENAMES CONFIG_VERSION_CODE_FILENAMES; do
+    sed -i -e "/^${sym}=/d" -e "/^# ${sym} is not set$/d" "$TREE/.config"
+    printf '# %s is not set\n' "$sym" >> "$TREE/.config"
+done
+info "已锁定 target/设备，并关闭版本号进文件名（VERNUM + VERCODE）"
+
+# 强制写进 .config：先删旧行再追加，避免出现两条互相矛盾的记录
+force_pkg() {
+    local sym
+    for sym in "$@"; do
+        sed -i -e "/^CONFIG_PACKAGE_${sym}=/d" \
+               -e "/^# CONFIG_PACKAGE_${sym} is not set$/d" "$TREE/.config"
+        printf 'CONFIG_PACKAGE_%s=y\n' "$sym" >> "$TREE/.config"
+    done
+}
+disable_pkg() {
+    local sym
+    for sym in "$@"; do
+        sed -i -e "/^CONFIG_PACKAGE_${sym}=/d" \
+               -e "/^# CONFIG_PACKAGE_${sym} is not set$/d" "$TREE/.config"
+        printf '# CONFIG_PACKAGE_%s is not set\n' "$sym" >> "$TREE/.config"
+    done
+}
+
+# ---- 2a. dnsmasq-full（OpenClash 硬依赖，nftset 走 nftables 那条路）----------
+# dnsmasq 与 dnsmasq-full 互斥，只留 full；nftset 会把 nftables-json 带进来。
+disable_pkg dnsmasq
+force_pkg dnsmasq-full dnsmasq_full_nftset dnsmasq_full_dnssec
+info "DNS：dnsmasq -> dnsmasq-full（nftset + dnssec 打开）"
+
+# ---- 2b. 代理相关的内核模块 ------------------------------------------------
+# xg-040g-md.config 里那段注释说得对，这里照搬并写死：kmod 带内核 vermagic 哈希，
+# 刷完机再 apk add 是装不上的（官方源那份对不上自建固件），必须编进镜像。
+# 整组加起来约 40 KB，但少了它们 sing-box / clash 的 tun、tproxy、ss 全废。
+# OpenWrt 的 package-metadata.pl 会把这些包的 KCONFIG 写进 kernel .config，
+# 不需要自己去改 config-6.18。
+force_pkg \
+    kmod-nft-core kmod-nft-nat kmod-nf-flow kmod-nft-offload kmod-nfnetlink \
+    kmod-nft-tproxy kmod-nft-socket kmod-nf-socket \
+    kmod-tun kmod-inet-diag kmod-netlink-diag kmod-br-netfilter
+info "已强制保留代理相关内核模块（tproxy / nft-socket / tun / inet-diag / netlink-diag）"
+
+# ------------------------------------------------- 3. smartdns 换成你的源码
+if [ "$DIY_SMARTDNS" = 1 ]; then
+    SD_MK=feeds/packages/net/smartdns/Makefile
+    [ -f "$SD_MK" ] || die "找不到 $SD_MK —— 请把本脚本放到 feeds update/install 之后执行"
+
+    # 改成 git 协议直接拉分支，不再走 codeload tarball。
+    # 理由：tarball 方案要同时猜对三件事——tarball 顶层目录名、PKG_BUILD_DIR、
+    # PKG_HASH，任何一个对不上都会编失败，而且报错全被 make 吞掉只剩一行
+    # "failed to build"。git 协议三个问题一次全消，也是 ImmortalWrt-Airoha
+    # 那边用的写法。整份 Makefile 重写，不 sed 官方那份（46.1 的结构与 48.x 不同）。
+
+    # DEPENDS 需要显式带上 +zlib。
+    # src/Makefile 的 WITH_ZLIB 默认是 auto：探测到 host 有 zlib 就加 -DWITH_ZLIB
+    # 并链接 -lz。于是二进制 NEEDED 里有 libz.so.1，而官方 46.1 那份 Makefile 的
+    # DEPENDS 只有 libpthread/libopenssl，打包 apk 时 OpenWrt 找不到 libz.so.1
+    # 的提供者，直接报：
+    #   Package smartdns is missing dependencies for the following libraries: libz.so.1
+    # 注意失败发生在"打 apk"这一步，不是编译——所以 src/smartdns 其实已经编出来了，
+    # 日志里能看到 install 到 ipkg 的全过程，很容易被误导成编译问题。
+    #
+    # 另外别加 +libatomic：src/Makefile 里的 -latomic 只在 USE_ATOMIC 探测失败时才加，
+    # 而 aarch64 上 __atomic_* 是编译器内联的，探测必然通过；凭空加一个树里可能
+    # 不存在的 DEPENDS，反而会让 defconfig 把 smartdns 整包静默丢掉。
+    cat > "$SD_MK" <<EOF
+include \$(TOPDIR)/rules.mk
+
+PKG_NAME:=smartdns
+PKG_VERSION:=48.4
+PKG_RELEASE:=1
+
+# git 协议：直接跟分支，永远拿到分支 HEAD，不受 tag/tarball 命名影响
+PKG_SOURCE_PROTO:=git
+PKG_SOURCE_URL:=https://github.com/${SMARTDNS_REPO}.git
+PKG_SOURCE_VERSION:=${SMARTDNS_REF}
+PKG_MIRROR_HASH:=skip
+
+PKG_MAINTAINER:=Nick Peng <pymumu@gmail.com>
+PKG_LICENSE:=GPL-3.0-or-later
+PKG_LICENSE_FILES:=LICENSE
+
+PKG_BUILD_PARALLEL:=1
+
+include \$(INCLUDE_DIR)/package.mk
+
+MAKE_VARS += VER=\$(PKG_VERSION)
+MAKE_PATH:=src
+
+define Package/smartdns
+  SECTION:=net
+  CATEGORY:=Network
+  TITLE:=smartdns server
+  SUBMENU:=IP Addresses and Names
+  DEPENDS:=+libpthread +libopenssl +zlib
+  URL:=https://www.github.com/pymumu/smartdns/
+endef
+
+define Package/smartdns/description
+SmartDNS is a local DNS server which accepts DNS query requests from local network clients,
+gets DNS query results from multiple upstream DNS servers concurrently, and returns the fastest IP to clients.
+endef
+
+define Package/smartdns/conffiles
+/etc/config/smartdns
+/etc/smartdns/address.conf
+/etc/smartdns/blacklist-ip.conf
+/etc/smartdns/custom.conf
+/etc/smartdns/domain-block.list
+/etc/smartdns/domain-forwarding.list
+endef
+
+define Package/smartdns/install
+	\$(INSTALL_DIR) \$(1)/usr/sbin \$(1)/etc/config \$(1)/etc/init.d
+	\$(INSTALL_DIR) \$(1)/etc/smartdns \$(1)/etc/smartdns/domain-set \$(1)/etc/smartdns/conf.d/
+	\$(INSTALL_DIR) \$(1)/etc/smartdns/ip-set \$(1)/etc/smartdns/download
+	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/src/smartdns \$(1)/usr/sbin/smartdns
+	\$(INSTALL_BIN) \$(PKG_BUILD_DIR)/package/openwrt/files/etc/init.d/smartdns \$(1)/etc/init.d/smartdns
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/address.conf \$(1)/etc/smartdns/address.conf
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/blacklist-ip.conf \$(1)/etc/smartdns/blacklist-ip.conf
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/custom.conf \$(1)/etc/smartdns/custom.conf
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/domain-block.list \$(1)/etc/smartdns/domain-block.list
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/domain-forwarding.list \$(1)/etc/smartdns/domain-forwarding.list
+	\$(INSTALL_CONF) \$(PKG_BUILD_DIR)/package/openwrt/files/etc/config/smartdns \$(1)/etc/config/smartdns
+endef
+
+\$(eval \$(call BuildPackage,smartdns))
+EOF
+
+    info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}（git 协议）"
+    grep -E '^(PKG_SOURCE_PROTO|PKG_SOURCE_URL|PKG_SOURCE_VERSION|PKG_MIRROR_HASH):=' "$SD_MK" | sed 's/^/    /'
+    force_pkg smartdns luci-app-smartdns zlib
+
+    # ===== 关键：必须用 ImmortalWrt 那份界面，否则"故障转移/备用服务器"出不来 =====
+    # 三个来源实测对比（行数 / fallback 开关）：
+    #   feeds/luci 的 luci-app-smartdns  1.2023.42   1177 行   0 处   ← 2023 年，太老
+    #   你的分支 package/luci             48.4        1685 行   0 处   ← 官方同步版，也没有
+    #   ImmortalWrt 的 luci-app-smartdns  1.2025.47.2 1785 行   3 处   ← 只有这个有！
+    #
+    # 这就是 xg-040g-md（ImmortalWrt）界面上有"备用服务器"而你的没有的原因：
+    # ImmortalWrt 那边的界面比 pymumu 官方仓库自带的还新一版，多了
+    #   s.taboption("advanced", form.Flag, "fallback", _("Fallback"), ...)
+    # 且中文 po 把 Fallback 译作「备用服务器」——正是你在找的那个词。
+    #
+    # 后端不需要换：你的 48.4 init.d 第 236 行就读 uci 的 "fallback"，
+    # src/dns_client.c 也有 fallback group 的切换逻辑，只差界面上的一个开关。
+    # 所以只替换 JS + po，包本体仍用 feeds 的。
+    LUCI_JS=feeds/luci/applications/luci-app-smartdns/htdocs/luci-static/resources/view/smartdns/smartdns.js
+    if [ ! -f "$LUCI_JS" ]; then
+        warn "找不到 $LUCI_JS，跳过界面同步（luci-app-smartdns 可能没装）"
+    else
+        # 走 raw.githubusercontent 直取两个文件，不用克隆整个 immortalwrt/luci
+        # （那个 tarball 近 30 MB）。commit 固定，避免 master 变动导致构建漂移。
+        IMM_LUCI_REF="${IMM_LUCI_REF:-17f97c0bec190e18d4884ab8204f63c64981edd7}"
+        IMM_BASE="https://raw.githubusercontent.com/immortalwrt/luci/${IMM_LUCI_REF}/applications/luci-app-smartdns"
+        rm -rf /tmp/imm-smartdns-luci && mkdir -p /tmp/imm-smartdns-luci
+        curl -fsSL --retry 2 --max-time 120 -o /tmp/imm-smartdns-luci/smartdns.js \
+            "${IMM_BASE}/htdocs/luci-static/resources/view/smartdns/smartdns.js"
+        curl -fsSL --retry 2 --max-time 120 -o /tmp/imm-smartdns-luci/smartdns.po \
+            "${IMM_BASE}/po/zh_Hans/smartdns.po"
+
+        NEW_JS=/tmp/imm-smartdns-luci/smartdns.js
+        if [ -s "$NEW_JS" ]; then
+            cp "$NEW_JS" "$LUCI_JS"
+            info "LuCI 界面已同步为 ImmortalWrt 1.2025.47.2（$(wc -l < "$LUCI_JS") 行，含 fallback 开关）"
+        else
+            warn "下载 ImmortalWrt 界面失败，沿用 feeds 老界面（会缺「备用服务器」）"
+        fi
+        # 中文翻译同样用 ImmortalWrt 那份（296 条，含 Fallback → 备用服务器）。
+        # 你分支自带的是 274 条，没有 Fallback 这个词条，会显示成英文。
+        NEW_PO=/tmp/imm-smartdns-luci/smartdns.po
+        PO_DIR=feeds/luci/applications/luci-app-smartdns/po
+        if [ -s "$NEW_PO" ] && [ -d "$PO_DIR/zh_Hans" ]; then
+            cp "$NEW_PO" "$PO_DIR/zh_Hans/smartdns.po"
+            info "已同步中文翻译（$(grep -c msgid "$NEW_PO") 条，含「备用服务器」）"
+        fi
+        rm -rf /tmp/imm-smartdns-luci
+    fi
+fi
+
+# ------------------------------------------------------------ 4. OpenClash
+if [ "$DIY_OPENCLASH" = 1 ]; then
+    rm -rf package/OpenClash
+    git clone --depth 1 https://github.com/vernesong/OpenClash.git package/OpenClash
+    test -f package/OpenClash/luci-app-openclash/Makefile ||
+        die "OpenClash 目录结构变了，找不到 luci-app-openclash/Makefile"
+    # DEPENDS: +dnsmasq-full +bash +curl +ca-bundle +ip-full +ruby +ruby-yaml +kmod-tun +unzip
+    # luci-compat 在官方 luci feed 的 modules/ 下还留着，turboacc 也硬依赖它，
+    # 一并显式勾上，省得 defconfig 静默丢包。
+    force_pkg luci-app-openclash ruby ruby-yaml bash curl unzip ip-full luci-compat
+    info "OpenClash $(sed -n 's/^PKG_VERSION:=//p' package/OpenClash/luci-app-openclash/Makefile) 已就位"
+fi
+
+# ------------------------------------------------------------ 5. TurboACC
+# 注意这个脚本会做三件有副作用的事：
+#   1) 删除并用 chenmozhijin 的版本替换 package/network/config/firewall4、
+#      package/network/utils/nftables、package/libs/libnftnl（fullcone 需要补丁版）；
+#   2) 给 target/linux/generic 打 952/953/613 三个内核补丁；
+#   3) 往 target/linux/generic/config-6.18 追加 NF_CONNTRACK_CHAIN_EVENTS。
+# --no-sfe 跳过 shortcut-fe（953 补丁）：本机已经有原生 flowtable 硬件加速
+# （port/overlay 里的 190-native-flowtable.patch / 205-flowtable-pppoe-session.patch），
+# 再叠一层 SFE 是抢同一条路径，编不编得过、编出来稳不稳都不划算。
+if [ "$DIY_TURBOACC" = 1 ]; then
+    rm -rf package/turboacc
+    curl -fsSL https://raw.githubusercontent.com/chenmozhijin/turboacc/luci/add_turboacc.sh \
+        -o /tmp/add_turboacc.sh
+    bash /tmp/add_turboacc.sh --no-sfe
+    rm -f /tmp/add_turboacc.sh
+    test -d package/turboacc || die "turboacc 装载失败（package/turboacc 不存在）"
+    # 符号名与 ImmortalWrt 的 CONFIG_PACKAGE_TURBOACC_INCLUDE_* 不同，
+    # 这里是 chenmozhijin 的 luci-app-turboacc_INCLUDE_*，别照抄 xg 那份配置。
+    force_pkg luci-app-turboacc
+    printf '%s\n' \
+        'CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_BBR_CCA=y' \
+        'CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_OFFLOADING=y' \
+        'CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_NFT_FULLCONE=y' \
+        '# CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE is not set' \
+        '# CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE_CM is not set' \
+        '# CONFIG_PACKAGE_luci-app-turboacc_INCLUDE_SHORTCUT_FE_DRV is not set' \
+        >> "$TREE/.config"
+    info "turboacc 已装载（BBR + flow offload + fullcone，不带 SFE）"
+fi
+
+# ------------------------------------------------------- 6. 可选：argon 主题
+# 官方 luci feed 没有 argon。jerrykuku 那两份用的是 include ../../luci.mk，
+# 直接丢在 package/ 下会解析到不存在的路径，所以顺手改成绝对路径。
+if [ "$DIY_ARGON" = 1 ]; then
+    for r in luci-theme-argon luci-app-argon-config; do
+        rm -rf "package/$r"
+        git clone --depth 1 "https://github.com/jerrykuku/${r}.git" "package/$r"
+        sed -i 's|include ../../luci.mk|include $(TOPDIR)/feeds/luci/luci.mk|' "package/$r/Makefile"
+    done
+    force_pkg luci-theme-argon luci-app-argon-config
+    info "argon 主题已装载"
+fi
+
+# ---------------------------------------------- 7. 可选：动态域名（DDNS）
+# 用官方 feeds 的 ddns-scripts + luci-app-ddns，不用 ddns-go。
+# 理由：rootfs 上限 32.09 MiB，刷完机可用空间只剩约 11 MiB；ddns-go 的 Go 二进制
+# 8~12 MB 会吃掉几乎全部余量，还要编 40~60 分钟 Go 工具链。ddns-scripts 全套几百 KB，
+# 且默认 10 分钟轮询 + hotplug 网口事件即时触发，IP 未变化还不发请求，功能完全够用。
+#
+# 包名与依赖（对应本项目锁定的 feeds 版本，均已核实）：
+#   ddns-scripts               DEPENDS: +ddns-scripts-services +resolveip +ip
+#   ddns-scripts-cloudflare    DEPENDS:  ddns-scripts +curl   （TITLE: Extension for cloudflare.com API v4）
+#   luci-app-ddns              LUCI_DEPENDS: +luci-base +ddns-scripts +ucode-mod-math
+if [ "$DIY_DDNS" = 1 ]; then
+    # 必须显式 feeds install：prepare_luci_feeds.sh 只装 .config 里 CONFIG_PACKAGE_*=[ym]
+    # 列出的包，而这里的开关是在 defconfig 之后才写入 .config 的，不手动装就找不到。
+    ./scripts/feeds install ddns-scripts ddns-scripts-cloudflare luci-app-ddns ucode-mod-math
+
+    force_pkg ddns-scripts ddns-scripts-cloudflare luci-app-ddns \
+              luci-i18n-ddns-zh-cn curl resolveip ucode-mod-math
+    info "DDNS（ddns-scripts + luci-app-ddns + cloudflare 扩展）已就位"
+    echo "     刷机后：服务 → 动态 DNS。PPPoE 场景公网 IPv6 常在 LAN 口，"
+    echo "     ip_network 可能需要填 br-lan 而不是 wan6（先 ip -6 addr show 确认）。"
+fi
+
+# ------------------------------------------------------------------ 8. 收尾
+info "diy-part.sh 完成。接下来 build.sh 会执行 prepare_luci_feeds -> make defconfig"
+cat <<'EOF'
+
+提醒：
+  1) 源码树里不存在的包，make defconfig 会静默丢行、不报错。
+     编完去 artifacts/build.log / bin/packages 核对 luci-app-openclash、
+     luci-app-smartdns、luci-app-turboacc 是否真的编出来了。
+  2) rootfs.squashfs 硬上限 33648640 字节（约 32.09 MiB，原厂 UBI 卷大小），
+     超了会在打包镜像那一步直接失败（port/overlay/.../image/Makefile）。
+     OpenClash 带的 ruby 是体积大头，超了先砍它，再砍 fullcone。
+EOF
