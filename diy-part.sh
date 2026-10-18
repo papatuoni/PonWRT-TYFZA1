@@ -114,12 +114,29 @@ info "已锁定 target/设备，并关闭版本号进文件名（VERNUM + VERCOD
 #
 # 填 n 是安全的：Kconfig 里它的默认值就是 N，且 port/configs/tyfza1-compat.config
 # 并不要求 kmod-tyfza1-usb-led，所以没有任何包依赖它为 y/m。
-KC=target/linux/rtl9617c/config-6.18
-if [ -f "$KC" ] && ! grep -q 'CONFIG_LEDS_TRIGGER_TYFZA1_USB' "$KC"; then
-    printf '# CONFIG_LEDS_TRIGGER_TYFZA1_USB is not set\n' >> "$KC"
+#
+# ⚠⚠ 关键：必须改【仓库根的 overlay 源】，不能只改源码树里的副本！
+#    build.sh 会在 DIY 之后执行 sync-overlay.sh，里面是：
+#       rsync -a --delete port/overlay/target/linux/rtl9617c/ $TREE/target/linux/rtl9617c/
+#    --delete 会把我们写进源码树的那一行当成多余内容删掉，还原成 overlay 原版，
+#    于是补丁"执行了但没生效"，内核照样崩在同一个地方。
+#    改 overlay 源之后 rsync 会把它带进源码树，才真正生效。
+add_kconfig_n() {  # $1=文件
+    [ -f "$1" ] || return 1
+    grep -q 'CONFIG_LEDS_TRIGGER_TYFZA1_USB' "$1" && return 0
+    printf '# CONFIG_LEDS_TRIGGER_TYFZA1_USB is not set\n' >> "$1"
+    info "  已补齐 $1"
+}
+
+KC_REL=target/linux/rtl9617c/config-6.18
+KC_OVERLAY="$REPO_ROOT/port/overlay/$KC_REL"     # 决定性的一处
+KC_TREE="$TREE/$KC_REL"                          # 顺带也写，便于本地直接编
+add_kconfig_n "$KC_OVERLAY" || warn "没找到 $KC_OVERLAY，overlay 结构可能变了"
+add_kconfig_n "$KC_TREE" || true
+if grep -q 'CONFIG_LEDS_TRIGGER_TYFZA1_USB' "$KC_OVERLAY" 2>/dev/null; then
     info "补齐内核符号：CONFIG_LEDS_TRIGGER_TYFZA1_USB=n（上游 v0.8.0 漏配）"
-elif [ ! -f "$KC" ]; then
-    warn "没找到 $KC，跳过内核符号补齐（overlay 可能没同步）"
+else
+    warn "内核符号补齐未生效——sync-overlay 后仍会 Report LEDS_TRIGGER_TYFZA1_USB (NEW)"
 fi
 
 # 强制写进 .config：先删旧行再追加，避免出现两条互相矛盾的记录
