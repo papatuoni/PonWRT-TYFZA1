@@ -33,7 +33,7 @@ on:
         required: false
         default: '1'
       diy_ddns:
-        description: 'Add ddns-go + luci-app-ddns-go from ImmortalWrt (1=yes, 0=no)'
+        description: 'Add ddns-scripts + luci-app-ddns (1=yes, 0=no)'
         required: false
         default: '1'
       diy_smartdns_ui:
@@ -112,7 +112,7 @@ jobs:
               [ "$DIY_SMARTDNS" = 1 ] && echo "- smartdns：papatuoni/smartdns @ custom-48.4"
               echo "- OpenClash：vernesong/OpenClash"
               echo "- TurboACC：BBR + flow offload + fullcone（不带 SFE）"
-              [ "$DIY_DDNS" = 1 ] && echo "- 动态 DNS：ddns-go + luci-app-ddns-go（ImmortalWrt）"
+              [ "$DIY_DDNS" = 1 ] && echo "- 动态 DNS：ddns-scripts + luci-app-ddns（Cloudflare 扩展）"
               [ "$DIY_SMARTDNS_UI" = 1 ] && echo "- smartdns Web 仪表盘 smartdns-ui（:6080，admin/password）"
               [ "$DIY_WIRELESS" != 1 ] && echo "- 已关闭无线（kmod-rtl-ax-ap / wpad / wifi-scripts 均未编入）"
               echo
