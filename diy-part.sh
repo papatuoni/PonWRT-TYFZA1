@@ -18,7 +18,7 @@
 #    DIY_TURBOACC=1  装载 chenmozhijin/turboacc（会替换 firewall4/nftables/libnftnl）
 #    DIY_OPENCLASH=1 装载 vernesong/OpenClash
 #    DIY_SMARTDNS=1  把 smartdns 源码换成 papatuoni/smartdns 的 custom-48.4
-#    DIY_DDNS=1      装载 ImmortalWrt 的 ddns-go + luci-app-ddns-go
+#    DIY_DDNS=1      装载 ddns-scripts + luci-app-ddns（官方 feeds）
 #    DIY_WIRELESS=0  关闭无线（默认关，见第 2-2 步说明）
 #    DIY_LAN_IP=192.168.2.1
 # ============================================================================
@@ -40,7 +40,9 @@ DIY_SMARTDNS_UI="${DIY_SMARTDNS_UI:-0}"
 SMARTDNS_REPO="${SMARTDNS_REPO:-papatuoni/smartdns}"
 SMARTDNS_REF="${SMARTDNS_REF:-custom-48.4}"
 
-# ImmortalWrt 源（ddns-go / luci-app-ddns-go 从这里取）
+# ImmortalWrt 源（smartdns 的 Makefile / LuCI 界面从这里取）
+# smartdns 本体用的是官方 feeds 的目录，但 Makefile 换成 ImmortalWrt 那份
+# （它把 Web 仪表盘做成了独立子包 smartdns-ui），界面也用它那版。
 IMM_PKGS_REPO="${IMM_PKGS_REPO:-immortalwrt/packages}"
 IMM_PKGS_REF="${IMM_PKGS_REF:-master}"     # 建议改成固定 commit，避免漂移
 IMM_LUCI_REPO="${IMM_LUCI_REPO:-immortalwrt/luci}"
@@ -457,74 +459,51 @@ fi
 #   我们自己 clone 出来的是真实目录（不是软链接），会直接把构建打断。
 # 结论：argon 归上游，本脚本什么都不做。
 
-# ---------------------------------------------- 7. 可选：动态域名（ddns-go）
-# 用 ImmortalWrt 的 ddns-go + luci-app-ddns-go，不再用 ddns-scripts。
+# ------------------------------------------ 7. 可选：动态域名（ddns-scripts）
+# 用官方 feeds 的 ddns-scripts + luci-app-ddns。
 #
-# 换回来的原因：v0.8.0 改了存储布局（RELEASE_NOTES: "修复可写空间固定为 16 MiB…
-# 实机确认可写空间扩大"）。刷机日志里能看到 ubi_apps 卷有 793 LEBs ≈ 94 MiB
-# （ubi0:10 挂载成功），不再是之前那个 32 MiB rootfs / 11 MiB 可用的窘境。
-# 所以之前"为了省空间只能用 ddns-scripts"的理由已经不成立。
-# ddns-go 是 Go 写的，自带 Web 配置界面，支持 Cloudflare / 阿里云 / Dnspod /
-# 华为云 / Callback 等十余家，比 ddns-scripts 好用得多。
+# 为什么不用 ddns-go（2026-10-19 实测后改回）：
+#   读 port/overlay/.../base-files/lib/upgrade/tyfza1-storage.sh 的分配算法：
+#     TYFZA1_DATA_BYTES = (free + root_ebs + data_ebs) * leb - TYFZA1_ROOT_BYTES
+#   即可写空间 = 总池子 - rootfs.squashfs（对齐到 LEB）；root 越大可写越少，
+#   同一个池子里此消彼长。而脚本开头明确写着：
+#     "Only the selected OpenWrt root and rootfs_data participate in allocation.
+#      Keep every OEM volume ... at its original size."
+#   所以刷机日志里那个 94 MiB 的 ubi_apps（ubi0:10）是 OEM 卷、被原样保留用于
+#   回退，OpenWrt 装包根本用不到它。官方 RELEASE_NOTES 的"约 34.6 MiB"是
+#   在官方那份精简 rootfs 下测的。
+#   实测：rootfs 19.56 MiB + rootfs_data 14.9 MiB ≈ 34.5 MiB 总池子；
+#   再塞 ddns-go（Go 二进制 8~12 MB）就把可写空间压到只剩 16 MiB。
+#   ddns-scripts 全套几百 KB，Cloudflare + IPv6 需要的功能都有（见下）。
 #
-# 包名与依赖（ImmortalWrt，均已核实）：
-#   ddns-go          6.17.6  DEPENDS: $(GO_ARCH_DEPENDS) +ca-bundle
-#                            PKG_BUILD_DEPENDS: golang/host   ← 关键，见下
-#   luci-app-ddns-go         LUCI_DEPENDS: +ddns-go
+# 功能上完全够用（逐条对过源码）：
+#   - 10 分钟轮询 + hotplug 网口事件即时触发（ifup/ifdown/ifupdate）
+#   - IP 未变不发请求（Cloudflare 脚本逐位比对后跳过）
+#   - 失败按 60 秒重试，而不是傻等 10 分钟
+#   - use_ipv6=1 自动走 AAAA，curl 强制 -6
+#   - 更新后用 resolveip 反查域名做 DNS 验证，确认真的生效
+#
+# 包名与依赖（官方 feeds，均已核实）：
+#   ddns-scripts            2.8.4  DEPENDS: +ddns-scripts-services +resolveip +ip
+#   ddns-scripts-cloudflare        DEPENDS: ddns-scripts +curl
+#   luci-app-ddns                  LUCI_DEPENDS: +luci-base +ddns-scripts
+#                                                +ucode-mod-math
 if [ "$DIY_DDNS" = 1 ]; then
-    # ===== 关键：golang 宿主工具链必须显式装进源码树 =====
-    # ddns-go 的 Makefile 有 PKG_BUILD_DEPENDS:=golang/host。
-    # 但 prepare_luci_feeds.sh 只装 .config 里 CONFIG_PACKAGE_*=[ym] 列出的包，
-    # golang 不在其中，于是会留下一条不致命的 WARNING：
-    #   WARNING: Makefile 'package/ddns-go/Makefile' has a build dependency
-    #            on 'golang/host', which does not exist
-    # make 会照常往下跑，直到 go 命令找不到才失败（PATH 里有
-    # staging_dir/hostpkg/lib/go-1.27/bin，但那个目录压根没生成）。
-    # 依赖链三层，缺一不可（scripts/feeds install 不处理 HOST_BUILD_DEPENDS）：
-    #   golang/host     → golang1.27/host → golang-bootstrap/host
-    ./scripts/feeds install golang golang1.27 golang-bootstrap
-    for p in golang golang1.27 golang-bootstrap; do
-        [ -e "package/feeds/packages/lang/golang/$p" ] ||
-            warn "feeds install 后仍找不到 lang/golang/$p，golang/host 可能装不全"
-    done
+    # Cloudflare 扩展和 LuCI 界面都在 feeds 里，但要确保它们进了源码树：
+    # prepare_luci_feeds.sh 只装 .config 里 CONFIG_PACKAGE_*=[ym] 列出的包，
+    # 而这里的开关是在 defconfig 之后才写入 .config 的，所以得手动 install。
+    ./scripts/feeds install ddns-scripts ddns-scripts-cloudflare \
+        luci-app-ddns ucode-mod-math
 
-    # --- 本体（ImmortalWrt packages）---
-    rm -rf package/ddns-go /tmp/imm-ddnsgo
-    mkdir -p /tmp/imm-ddnsgo
-    curl -fsSL --retry 2 --max-time 180 \
-        "https://codeload.github.com/${IMM_PKGS_REPO}/tar.gz/${IMM_PKGS_REF}" \
-        | tar -xz -C /tmp/imm-ddnsgo --strip-components=1 \
-              --wildcards "*/net/ddns-go/*" 2>/dev/null
-    if [ -f /tmp/imm-ddnsgo/net/ddns-go/Makefile ]; then
-        cp -r /tmp/imm-ddnsgo/net/ddns-go package/ddns-go
-    else
-        die "从 ImmortalWrt 取 net/ddns-go 失败"
-    fi
-
-    # --- LuCI 界面（ImmortalWrt luci）---
-    rm -rf package/luci-app-ddns-go /tmp/imm-luci-dg
-    mkdir -p /tmp/imm-luci-dg
-    curl -fsSL --retry 2 --max-time 300 \
-        "https://codeload.github.com/${IMM_LUCI_REPO}/tar.gz/${IMM_LUCI_REF}" \
-        | tar -xz -C /tmp/imm-luci-dg --strip-components=1 \
-              --wildcards "*/applications/luci-app-ddns-go/*" 2>/dev/null
-    if [ -f /tmp/imm-luci-dg/applications/luci-app-ddns-go/Makefile ]; then
-        cp -r /tmp/imm-luci-dg/applications/luci-app-ddns-go package/luci-app-ddns-go
-    else
-        die "从 ImmortalWrt 取 applications/luci-app-ddns-go 失败"
-    fi
-    rm -rf /tmp/imm-ddnsgo /tmp/imm-luci-dg
-
-    # 两份 Makefile 都写的是相对路径，放 package/ 下够不着，必须改成绝对路径
-    sed -i 's|include ../../lang/golang/golang-package.mk|include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk|' \
-        package/ddns-go/Makefile
-    sed -i 's|include ../../luci.mk|include $(TOPDIR)/feeds/luci/luci.mk|' \
-        package/luci-app-ddns-go/Makefile
-
-    # ca-bundle 不写：tyfza1-compat.config 已强制 =y，写了是重复
-    force_pkg ddns-go luci-app-ddns-go luci-i18n-ddns-go-zh-cn
-    info "ddns-go $(sed -n 's/^PKG_VERSION:=//p' package/ddns-go/Makefile) + luci-app-ddns-go 已就位"
-    warn "ddns-go 需要编 Go 宿主工具链（golang/host），这一步很慢，可能多花 20~40 分钟"
+    # 依赖说明：
+    #   ddns-scripts-services / resolveip / ip  → 主包 DEPENDS 自动带，不用写
+    #   curl                                   → ddns-scripts-cloudflare 自动带
+    #   ca-bundle                              → tyfza1-compat.config 已强制 =y
+    force_pkg ddns-scripts ddns-scripts-cloudflare luci-app-ddns \
+              luci-i18n-ddns-zh-cn curl resolveip ucode-mod-math
+    info "DDNS（ddns-scripts 2.8.4 + luci-app-ddns + cloudflare 扩展）已就位"
+    echo "  刷完机后：服务 → 动态 DNS，按你的 WAN/LAN 接口配 use_ipv6=1"
+    echo "  ⚠ PPPoE 场景下公网 IPv6 通常在 LAN 口，ip_network 可能要填 br-lan"
 fi
 
 # ------------------------------------------------------------------ 8. 收尾
@@ -534,7 +513,7 @@ cat <<'EOF'
 提醒：
   1) 源码树里不存在的包，make defconfig 会静默丢行、不报错。
      编完去 artifacts/build.log / bin/packages 核对 luci-app-openclash、
-     luci-app-smartdns、luci-app-turboacc、ddns-go 是否真的编出来了。
+     luci-app-smartdns、luci-app-turboacc、ddns-scripts 是否真的编出来了。
   2) rootfs.squashfs 仍有硬上限 33648640 字节（约 32.09 MiB，原厂 rootfs 卷大小），
      超了会在打包镜像那一步失败（port/overlay/.../image/Makefile）。
      OpenClash 带的 ruby 是体积大头，超了先砍它，再砍 fullcone。
@@ -545,6 +524,8 @@ cat <<'EOF'
      强制追加，本脚本不碰（碰了会让构建直接退出，见第 6 步注释）。
   5) 无线默认关闭（DIY_WIRELESS=0），改的是 overlay 源的 DEVICE_PACKAGES。
      想恢复：workflow 或本地 export DIY_WIRELESS=1 重编。
-  6) 可写空间已不是 11 MiB：v0.8.0 新布局下 ubi_apps 卷约 94 MiB（ubi0:10），
-     所以 ddns-go（Go，8~12 MB）这类体积完全可接受。
+  6) 【可写空间】= 总池子 − rootfs.squashfs，两者此消彼长（见 tyfza1-storage.sh
+     的 TYFZA1_DATA_BYTES 算法）。总池子约 34.5 MiB，rootfs 每大 1 MB，可写就少
+     1 MB。ubi_apps 那 94 MiB 是 OEM 卷、原样保留给回退用，装包用不到它。
+     所以加插件就是在动可写空间——这是第 7 步换回 ddns-scripts 的原因。
 EOF
