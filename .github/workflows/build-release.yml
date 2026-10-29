@@ -121,7 +121,11 @@ jobs:
               echo "- TurboACC：BBR + flow offload + fullcone（不带 SFE）"
               [ "$DIY_DDNS" = 1 ] && echo "- 动态 DNS：ddns-scripts + luci-app-ddns（Cloudflare 扩展）"
               [ "$DIY_SMARTDNS_UI" = 1 ] && echo "- smartdns Web 仪表盘 smartdns-ui（:6080，admin/password）"
-              [ "$DIY_WIRELESS" != 1 ] && echo "- 已关闭无线（kmod-rtl-ax-ap / wpad / wifi-scripts 均未编入，且无法事后装回）"
+              if [ "$DIY_WIRELESS" != 1 ]; then
+                echo "- 已关闭无线（kmod-rtl-ax-ap / wpad / wifi-scripts 均未编入，且无法事后装回）"
+              else
+                echo "- 已开启无线（默认保留 kmod-rtl-ax-ap / wpad-mbedtls / wifi-scripts）"
+              fi
               echo
               echo "刷机方法与已知问题见仓库 README；上游变更见 RELEASE_NOTES.md。"
             } > "$RUNNER_TEMP/release-notes.md"
@@ -256,6 +260,15 @@ jobs:
           if [ "$DIY_WIRELESS" = 1 ]; then
             check kmod-rtl-ax-ap y
             check wpad-mbedtls y
+            echo "===== 无线驱动 .ko 是否真的产出（终极证据）====="
+            KO=$(find "$GITHUB_WORKSPACE/sources/openwrt" -name 'rtl_ax_ap.ko' 2>/dev/null | head -1)
+            if [ -n "$KO" ]; then
+              echo "  OK   $KO"
+            else
+              echo "  MISS rtl_ax_ap.ko 没找到 <- 驱动没编出来，刷完机不会有 Wi-Fi"
+              echo "       常见原因：CONFIG_CFG80211 / CONFIG_MAC80211 内核依赖未满足，"
+              echo "       make defconfig 静默删掉了 CONFIG_PACKAGE_kmod-rtl-ax-ap。"
+            fi
           fi
           echo "===== 产物 apk/ipk 是否真的生成 ====="
           find "$GITHUB_WORKSPACE/sources/openwrt/bin" \
