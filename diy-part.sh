@@ -48,8 +48,16 @@ DIY_DDNS="${DIY_DDNS:-1}"
 # 当初"省 2~3 MB"的理由不成立，关掉反而等于永久失去 Wi-Fi。
 # 真不想用 Wi-Fi，刷完在 LuCI 里把 radio 禁用即可（软件开关，随时能开回来）。
 DIY_WIRELESS="${DIY_WIRELESS:-1}"
-# smartdns Web 仪表盘（Rust 插件 smartdns_ui.so + 前端 wwwroot）。
-# 编译成本高（Rust 依赖多），默认关；确认基线没问题后再开。
+# smartdns Web 仪表盘（Rust 插件 smartdns_ui.so + 前端 wwwroot）三态：
+#   0（默认）= 完全不构建。最快。node/host、rust/host、bindgen、npm、cargo 全跳过。
+#   m        = 构建出 apk，但不打进固件。产物在 bin/packages/，可下载后 apk add 装。
+#   1        = 构建并打进固件。
+#
+# ★ 重要：m 和 1 的编译耗时【完全一样】。看 ImmortalWrt 的 Makefile：
+#     PKG_BUILD_DEPENDS:=PACKAGE_smartdns-ui:node/host PACKAGE_smartdns-ui:rust-bindgen/host
+#     ifneq ($(CONFIG_PACKAGE_smartdns-ui),)   ← "m" 也是非空
+#   =m 只是不进 rootfs，npm install/build 和 cargo build 一步不少。
+#   想省时间只能是 0；想拿 apk 则必须跑一次 m（或 1），把 apk 存下来复用。
 DIY_SMARTDNS_UI="${DIY_SMARTDNS_UI:-0}"
 
 # 你的 smartdns 分支：改这里就能换源码，不用动 workflow
@@ -191,6 +199,16 @@ disable_pkg() {
         sed -i -e "/^CONFIG_PACKAGE_${sym}=/d" \
                -e "/^# CONFIG_PACKAGE_${sym} is not set$/d" "$TREE/.config"
         printf '# CONFIG_PACKAGE_%s is not set\n' "$sym" >> "$TREE/.config"
+    done
+}
+# 写成 =m：包会被编译出 apk/ipk 放在 bin/packages/，但不打进 rootfs 镜像。
+# 用于「编译一次产出 apk，之后刷机按需 apk add」。
+force_pkg_m() {
+    local sym
+    for sym in "$@"; do
+        sed -i -e "/^CONFIG_PACKAGE_${sym}=/d" \
+               -e "/^# CONFIG_PACKAGE_${sym} is not set$/d" "$TREE/.config"
+        printf 'CONFIG_PACKAGE_%s=m\n' "$sym" >> "$TREE/.config"
     done
 }
 
@@ -373,7 +391,7 @@ if [ "$DIY_SMARTDNS" = 1 ]; then
     # 后端 .so 是 Rust 的（plugin/smartdns-ui），前端是 npm 构建的静态页面。
     # 官方配置：plugin smartdns_ui.so + smartdns-ui.www-root /usr/share/smartdns/wwwroot
     # 默认账号密码 admin/password，监听 6080。
-    if [ "$DIY_SMARTDNS_UI" = 1 ]; then
+    if [ "$DIY_SMARTDNS_UI" = 1 ] || [ "$DIY_SMARTDNS_UI" = m ]; then
         # rust-bindgen 不在本项目锁定的 feeds 里（只有 lang/rust、lang/node），
         # 而 ImmortalWrt 的 Makefile 声明了 PACKAGE_smartdns-ui:rust-bindgen/host。
         # 不装的话只留一条不致命 WARNING，然后 cargo build 时 bindgen 找不到才真失败。
@@ -401,10 +419,24 @@ if [ "$DIY_SMARTDNS" = 1 ]; then
                 warn "feeds install 后仍找不到 lang/$p，node/host 或 rust/host 可能缺失"
         done
 
-        force_pkg smartdns-ui
-        info "smartdns-ui（Web 仪表盘）已启用：前端 npm 构建 + Rust 后端"
+        if [ "$DIY_SMARTDNS_UI" = m ]; then
+            force_pkg_m smartdns-ui
+            info "smartdns-ui：=m（编译出 apk，不打进固件）"
+            info "产物在 sources/openwrt/bin/packages/<arch>/<feed>/smartdns-ui-*.apk"
+            info "会随 build artifact 保留 14 天；也会随 Release 上传（见 workflow）"
+        else
+            force_pkg smartdns-ui
+            info "smartdns-ui（Web 仪表盘）已启用：前端 npm 构建 + Rust 后端，打进固件"
+        fi
         warn "这一步很慢：要编 node/host、rust/host、bindgen，再 npm build + cargo build"
         warn "可能额外 30~60 分钟；失败就把 V=s 的报错发我"
+    else
+        # 明确不设置，而不是留空让 defconfig 自己猜。
+        # 注意：Makefile 用 ifneq ($(CONFIG_PACKAGE_smartdns-ui),) 判断，
+        # 所以只要符号存在（哪怕是 =m）就会编 webui；彻底关闭必须是 not set。
+        disable_pkg smartdns-ui
+        info "smartdns-ui：不构建（0）。省掉 node/host、rust/host、bindgen、npm、cargo"
+        info "需要 Web 仪表盘时：跑一次 diy_smartdns_ui=m 拿 apk，或 =1 直接进固件"
     fi
 
     # ===== 关键：必须用 ImmortalWrt 那份界面，否则"故障转移/备用服务器"出不来 =====
