@@ -324,6 +324,20 @@ PYEOF
             info "已放宽 99-tyfza1-platform-packages：不再要求 wifi-scripts（只 pin LuCI 两个模块）"
         fi
     fi
+
+else
+    # ---- 主动确保无线驱动被选中（不能只靠 DEVICE_PACKAGES 被动继承）----
+    # 教训：DIY_WIRELESS=1 时这里原本什么都不做，完全指望设备的 DEVICE_PACKAGES。
+    # 但 kmod-rtl-ax-ap 是内核模块包，它的 KCONFIG 依赖是
+    #     CONFIG_CFG80211 / CONFIG_MAC80211   （见 overlay 的 define KernelPackage/rtl-ax-ap）
+    # 只要内核配置里这两项没开，make defconfig 就会【静默】把
+    # CONFIG_PACKAGE_kmod-rtl-ax-ap 删掉——不报错、编译照常成功、产物照常出，
+    # 只有刷完机才发现 rtl_ax_ap.ko 不存在。
+    # 而用户态那几个（iw / wifi-scripts / hostapd / wireless-regdb）没有这层依赖，
+    # 照样编进固件，于是表现为"无线工具都在、就是没有驱动"，极具迷惑性。
+    # 所以这里显式写进 .config 兜底，再由第 15 步自检复查符号是否真的还在。
+    force_pkg kmod-rtl-ax-ap wpad-mbedtls wifi-scripts wireless-regdb iw iwinfo
+    info "无线默认保留：已显式写 .config（kmod-rtl-ax-ap / wpad-mbedtls / wifi-scripts / wireless-regdb / iw / iwinfo）"
 fi
 
 # ------------------------------------------------- 3. smartdns 换成你的源码
