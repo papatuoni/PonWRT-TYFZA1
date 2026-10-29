@@ -1,5 +1,5 @@
 # ==========================================================================
-# DIY 版 —— 基于上游 v0.8.2-beta 骨架，加回自定义编译步骤，共 20 步（上游 15 步）
+# DIY 版 —— 基于上游 v0.8.2-beta 骨架，加回自定义编译步骤，共 21 步（上游 15 步）
 #
 # 一眼确认是否拿对文件：本文件应包含以下 6 项上游没有的内容
 #   1. inputs 里有 diy_enable / diy_smartdns / diy_ddns / diy_smartdns_ui / diy_wireless
@@ -43,7 +43,7 @@ on:
         required: false
         default: '1'
       diy_smartdns_ui:
-        description: 'smartdns Web dashboard (Rust plugin, slow, 1=yes)'
+        description: 'smartdns Web dashboard (Rust plugin, slow): 0=skip build, m=build apk only, 1=build+into firmware'
         required: false
         default: '0'
       diy_wireless:
@@ -227,6 +227,43 @@ jobs:
           export PATH="/usr/lib/llvm-18/bin:$PATH"
           sh port/scripts/build.sh sources/openwrt "$(nproc)" 2>&1 | tee artifacts/build.log
 
+      # ===== 新增：编译后自检（防止 "make defconfig 静默丢行" 刷完才发现）=====
+      # 本项目反复踩过：.config 里写了 =y，但包在源码树里不存在 / 依赖不满足时，
+      # make defconfig 会【静默删掉这一行、不报错】，编译照常成功、产物照常出，
+      # 只有刷完机才发现功能没了（smartdns-ui、无线驱动都栽在这）。
+      - name: 校验关键包确实编入
+        env:
+          DIY_SMARTDNS_UI: ${{ inputs.diy_smartdns_ui || '0' }}
+          DIY_WIRELESS: ${{ inputs.diy_wireless || '1' }}
+        run: |
+          CFG="$GITHUB_WORKSPACE/sources/openwrt/.config"
+          echo "===== 关键符号在 defconfig 之后是否还在 ====="
+          check() {
+            sym=$1; want=$2
+            if grep -q "^CONFIG_PACKAGE_${sym}=y" "$CFG"; then got=y
+            elif grep -q "^CONFIG_PACKAGE_${sym}=m" "$CFG"; then got=m
+            else got=n; fi
+            if [ "$got" = "$want" ]; then
+              echo "  OK   $sym = $got"
+            else
+              echo "  MISS $sym 期望=$want 实际=$got  <- make defconfig 把它丢了"
+            fi
+          }
+          [ -f "$CFG" ] || { echo "::warning::$CFG 不存在，跳过校验"; exit 0; }
+          check smartdns y
+          check luci-app-smartdns y
+          check smartdns-ui "$DIY_SMARTDNS_UI"
+          if [ "$DIY_WIRELESS" = 1 ]; then
+            check kmod-rtl-ax-ap y
+            check wpad-mbedtls y
+          fi
+          echo "===== 产物 apk/ipk 是否真的生成 ====="
+          find "$GITHUB_WORKSPACE/sources/openwrt/bin" \
+               \( -name "smartdns*.apk" -o -name "smartdns*.ipk" \) 2>/dev/null \
+            | sed 's|.*/|  |'
+          echo "（若 smartdns-ui 期望 y 却 MISS，或产物里没有 smartdns-ui，
+                多半是 node/host / rust-bindgen/host 没装上，见 diy-part.sh 第 3 段）"
+
       # ==================== 新增：失败时自动 V=s 复现真实报错 ====================
       - name: 定位失败点（V=s 复现）
         if: failure()
@@ -280,6 +317,18 @@ jobs:
           sh scripts/package_release.sh sources/openwrt artifacts/release
           git archive --format=tar.gz --prefix=PonWRT-TYFZA1/ HEAD \
             > artifacts/release/PonWRT-TYFZA1-source.tar.gz
+          # smartdns-ui 设为 m 时，apk 在 bin/packages/ 下、不打进镜像。
+          # 拷到这里 → 进 build artifact（14 天），并在 Publish release 时单独上传长期保存。
+          mkdir -p artifacts/release/packages
+          find sources/openwrt/bin/packages \
+               \( -name 'smartdns-ui*.apk' -o -name 'smartdns-ui*.ipk' \) \
+               -exec cp -v {} artifacts/release/packages/ \; 2>/dev/null || true
+          if [ -z "$(ls -A artifacts/release/packages 2>/dev/null)" ]; then
+            echo "没有 smartdns-ui 包产物（diy_smartdns_ui 不是 m/1，或没编出来）"
+          else
+            echo "===== smartdns-ui 包产物（可下载后 apk add 安装）====="
+            ls -la artifacts/release/packages/
+          fi
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         if: always()
         with:
@@ -300,6 +349,13 @@ jobs:
             artifacts/release/tyfza1-telnet-install.tar.gz artifacts/release/SHA256SUMS \
             artifacts/release/COPYING artifacts/release/PonWRT-TYFZA1-source.tar.gz \
             --repo "$GITHUB_REPOSITORY" --clobber
+          # smartdns-ui 的 apk（=m 时产出）单独上传，方便之后刷机直接 apk add 复用，
+          # 不用为了装个仪表盘再花 30~60 分钟重编一遍。
+          for pkg in artifacts/release/packages/smartdns-ui*.apk \
+                     artifacts/release/packages/smartdns-ui*.ipk; do
+            [ -e "$pkg" ] || continue
+            gh release upload "$RELEASE_TAG" "$pkg" --repo "$GITHUB_REPOSITORY" --clobber
+          done
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease=false --latest \
             --title "$RELEASE_TAG" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
