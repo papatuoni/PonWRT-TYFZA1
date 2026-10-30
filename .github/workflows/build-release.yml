@@ -260,15 +260,51 @@ jobs:
           if [ "$DIY_WIRELESS" = 1 ]; then
             check kmod-rtl-ax-ap y
             check wpad-mbedtls y
-            echo "===== 无线驱动 .ko 是否真的产出（终极证据）====="
+            echo "===== 无线驱动是否真的产出（终极证据）====="
+            # 上游实证：驱动是内核树内驱动，编译开关是【内核符号 CONFIG_RTL_AX_AP】
+            #   port/overlay/.../files-6.18/drivers/net/wireless/realtek/rtl_ax_ap/Makefile
+            #     obj-$(CONFIG_RTL_AX_AP) += rtl_ax_ap.o
+            # =y 时编进内核（built-in，根本没有 .ko，find 找不到属正常）
+            # =m 时才产出 rtl_ax_ap.ko
+            # 所以只看 .ko 会误判，必须先看内核符号，再看编译产物。
+            LINUX_DIR=$(find "$GITHUB_WORKSPACE/sources/openwrt/build_dir" \
+                         -maxdepth 4 -type d -name 'linux-6.18*' 2>/dev/null | head -1)
+            SYM=""
+            for f in "$LINUX_DIR/.config" \
+                     "$GITHUB_WORKSPACE/sources/openwrt/target/linux/rtl9617c/config-6.18"; do
+              [ -f "$f" ] && SYM=$(grep -E '^CONFIG_RTL_AX_AP=' "$f" 2>/dev/null | head -1) \
+                          && [ -n "$SYM" ] && break
+            done
+            echo "  CONFIG_RTL_AX_AP = ${SYM:-（未找到）}"
+            case "$SYM" in
+              CONFIG_RTL_AX_AP=y)
+                echo "  OK   驱动编进内核（built-in）—— 设备上没有 .ko 是正常的，" \
+                     "用 sh /tmp/check-dualwan.sh 看 /sys/class/ieee80211 判定"
+                ;;
+              CONFIG_RTL_AX_AP=m)
+                echo "  OK   驱动为模块形式，继续找 rtl_ax_ap.ko"
+                ;;
+              *)
+                echo "  MISS CONFIG_RTL_AX_AP 不是 y/m —— 驱动没编，刷完机不会有 Wi-Fi"
+                echo "       根因通常是 port/overlay 没进构建流程：驱动源码和"
+                echo "       KernelPackage/rtl-ax-ap 都在 overlay 里，官方 feeds 没有这个包，"
+                echo "       overlay 缺失时写 CONFIG_PACKAGE_kmod-rtl-ax-ap=y 会被静默丢弃。"
+                ;;
+            esac
             KO=$(find "$GITHUB_WORKSPACE/sources/openwrt" -name 'rtl_ax_ap.ko' 2>/dev/null | head -1)
+            OBJ=$(find "$GITHUB_WORKSPACE/sources/openwrt" -path '*rtl_ax_ap*' \
+                    -name 'rtl_ax_ap.o' 2>/dev/null | head -1)
             if [ -n "$KO" ]; then
-              echo "  OK   $KO"
+              echo "  OK   模块: $KO"
+            elif [ -n "$OBJ" ]; then
+              echo "  OK   目标文件: $OBJ（built-in，无 .ko）"
             else
-              echo "  MISS rtl_ax_ap.ko 没找到 <- 驱动没编出来，刷完机不会有 Wi-Fi"
-              echo "       常见原因：CONFIG_CFG80211 / CONFIG_MAC80211 内核依赖未满足，"
-              echo "       make defconfig 静默删掉了 CONFIG_PACKAGE_kmod-rtl-ax-ap。"
+              echo "  MISS rtl_ax_ap 既无 .ko 也无 .o —— 驱动源码根本没参与编译"
             fi
+            APK=$(find "$GITHUB_WORKSPACE/sources/openwrt/bin" \
+                    -name 'kmod-rtl-ax-ap*.apk' -o -name 'kmod-rtl-ax-ap*.ipk' 2>/dev/null | head -1)
+            [ -n "$APK" ] && echo "  OK   包产物: $(basename "$APK")" \
+                          || echo "  MISS 没找到 kmod-rtl-ax-ap 的 apk/ipk"
           fi
           echo "===== 产物 apk/ipk 是否真的生成 ====="
           find "$GITHUB_WORKSPACE/sources/openwrt/bin" \
@@ -325,6 +361,33 @@ jobs:
         run: |
           kernel=$(python3 port/tools/project_paths.py --kernel-directory sources/openwrt)
           python3 scripts/test_board_variants.py --kernel "$kernel"
+
+      # ============ 新增：smartdns 产物是否真的带补丁（不再靠刷机才发现）============
+      # 之前的问题：源码分支上 route_mgr 是死代码（没有调用点），编译静默成功，
+      # 刷完机 strings | grep dualwan 为空才发现白编一场，代价是一次编译 + 一次刷机。
+      # 这里在编译阶段就直接查，缺了立刻报出来。
+      - name: Verify smartdns dual-wan patch in build output
+        run: |
+          echo "===== smartdns 产物带不带 dualwan ====="
+          sd_bin=$(find sources/openwrt/build_dir -name smartdns -type f -perm -u+x 2>/dev/null | head -1)
+          if [ -z "$sd_bin" ]; then
+            echo "::warning::没找到 smartdns 二进制，跳过校验"
+            exit 0
+          fi
+          echo "二进制: $sd_bin"
+          ls -la "$sd_bin"
+          if strings "$sd_bin" 2>/dev/null | grep -qi dualwan; then
+            echo "  OK   smartdns 含 dualwan —— route_mgr 已进产物"
+            strings "$sd_bin" | grep -i dualwan | head -3 | sed 's/^/       /'
+          else
+            echo "  MISS smartdns 不含 dualwan"
+            echo ""
+            echo "  可能原因（按概率）："
+            echo "    1. smartdns 分支没应用接线补丁（route_mgr.c 存在但没有调用点）"
+            echo "    2. diy-part.sh 拿到的还是旧源码（看上一步打印的 SHA）"
+            echo "::error::smartdns 产物不含 dualwan，刷机后双 WAN 不会生效"
+            exit 1
+          fi
       - name: Package firmware and installer
         run: |
           sh scripts/package_release.sh sources/openwrt artifacts/release
