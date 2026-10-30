@@ -326,18 +326,60 @@ PYEOF
     fi
 
 else
-    # ---- 主动确保无线驱动被选中（不能只靠 DEVICE_PACKAGES 被动继承）----
-    # 教训：DIY_WIRELESS=1 时这里原本什么都不做，完全指望设备的 DEVICE_PACKAGES。
-    # 但 kmod-rtl-ax-ap 是内核模块包，它的 KCONFIG 依赖是
-    #     CONFIG_CFG80211 / CONFIG_MAC80211   （见 overlay 的 define KernelPackage/rtl-ax-ap）
-    # 只要内核配置里这两项没开，make defconfig 就会【静默】把
-    # CONFIG_PACKAGE_kmod-rtl-ax-ap 删掉——不报错、编译照常成功、产物照常出，
-    # 只有刷完机才发现 rtl_ax_ap.ko 不存在。
-    # 而用户态那几个（iw / wifi-scripts / hostapd / wireless-regdb）没有这层依赖，
-    # 照样编进固件，于是表现为"无线工具都在、就是没有驱动"，极具迷惑性。
-    # 所以这里显式写进 .config 兜底，再由第 15 步自检复查符号是否真的还在。
+    # ---- 校验驱动来源是否齐全（不再盲目 force_pkg）------------------------
+    # 【读上游源码 LeoooChen/PonWRT-TYFZA1 后的实证】
+    #   1. 无线驱动不是官方 feeds 里的包，是【内核树内驱动】，源码在
+    #        port/overlay/target/linux/rtl9617c/files-6.18/drivers/net/wireless/realtek/rtl_ax_ap/
+    #      由 sync-overlay.sh 的 rsync -a --delete 同步进 $TREE/target/linux/rtl9617c/
+    #   2. 包定义在 overlay 的 modules.mk：
+    #        define KernelPackage/rtl-ax-ap
+    #          KCONFIG:=CONFIG_CFG80211 CONFIG_MAC80211 CONFIG_RTL_AX_AP
+    #          FILES:= cfg80211.ko mac80211.ko rtl_ax_ap.ko
+    #      驱动自身编译开关是【内核符号 CONFIG_RTL_AX_AP】
+    #      （Makefile: obj-$(CONFIG_RTL_AX_AP) += rtl_ax_ap.o）
+    #   3. 所以：overlay 缺失 ⇒ kmod-rtl-ax-ap 包定义不存在 ⇒
+    #      写 CONFIG_PACKAGE_kmod-rtl-ax-ap=y 是往空气里写，defconfig 静默丢弃，
+    #      不报错、编译照常成功、产物照常出，只有刷完机才发现没有驱动。
+    #      ——这正是前几轮"改了脚本还是编不出"的根因：包名没错，是包压根不存在。
+    #   4. 另外 build_live_radio.sh 显示编译前还要把动态生成的 pe-tx-code.h
+    #      （PE 加速固件）拷进驱动目录，事后拿任何源都装不出等价 .ko。
+    #
+    # 结论：这里不做"补 .config"，而是【前置校验 + fail fast】。
+    #      三项缺一 = 必然编不出驱动 = 继续编译只是再浪费一小时。
+    OV="$REPO_ROOT/port/overlay/target/linux/rtl9617c"
+    DRV="$OV/files-6.18/drivers/net/wireless/realtek/rtl_ax_ap"
+    WL_MISSING=""
+
+    if [ ! -d "$OV" ]; then
+        WL_MISSING="$WL_MISSING overlay目录($OV)"
+        warn "port/overlay 不存在 —— 公开仓库不含它，需从上游构建环境/私有源获取"
+    else
+        n_src=$(ls "$DRV"/*.c 2>/dev/null | wc -l)
+        if [ "$n_src" -eq 0 ]; then
+            WL_MISSING="$WL_MISSING 驱动源码($DRV)"
+        else
+            info "无线驱动源码就位：rtl_ax_ap/ 下 $n_src 个 .c"
+        fi
+        if grep -rq "KernelPackage/rtl-ax-ap" "$OV" 2>/dev/null; then
+            info "无线包定义就位：KernelPackage/rtl-ax-ap"
+        else
+            WL_MISSING="$WL_MISSING 包定义(KernelPackage/rtl-ax-ap)"
+        fi
+        if grep -qE '^[[:space:]]*#?[[:space:]]*CONFIG_RTL_AX_AP' "$OV/config-6.18" 2>/dev/null; then
+            info "内核配置含 CONFIG_RTL_AX_AP"
+        else
+            warn "config-6.18 里没看到 CONFIG_RTL_AX_AP（可能靠 Kconfig 默认，需编后复查）"
+        fi
+    fi
+
+    if [ -n "$WL_MISSING" ]; then
+        die "无线驱动来源缺失:$WL_MISSING
+      驱动是内核树内私有驱动，只能随 overlay 一起编，事后装不回。
+      要么把 port/overlay 放进构建流程，要么用 DIY_WIRELESS=0 明确关掉无线。"
+    fi
+    # 来源齐全，再显式兜底（此时包名确实存在，写了才有效）
     force_pkg kmod-rtl-ax-ap wpad-mbedtls wifi-scripts wireless-regdb iw iwinfo
-    info "无线默认保留：已显式写 .config（kmod-rtl-ax-ap / wpad-mbedtls / wifi-scripts / wireless-regdb / iw / iwinfo）"
+    info "无线默认保留：来源已校验，已写 .config（kmod-rtl-ax-ap / wpad-mbedtls / wifi-scripts / wireless-regdb / iw / iwinfo）"
 fi
 
 # ------------------------------------------------- 3. smartdns 换成你的源码
@@ -381,15 +423,61 @@ if [ "$DIY_SMARTDNS" = 1 ]; then
     sed -i 's|include ../../lang/rust/rust-package.mk|include $(TOPDIR)/feeds/packages/lang/rust/rust-package.mk|' "$SD_MK"
     sed -i 's|include ../../lang/rust/rust-host-build.mk|include $(TOPDIR)/feeds/packages/lang/rust/rust-host-build.mk|' "$SD_MK"
 
+    # --- 防缓存 1：把分支解析成具体 commit SHA ---
+    # ⚠ 踩过的坑：PKG_SOURCE_VERSION 直接填分支名时，OpenWrt 把仓库镜像到 dl/，
+    #   而 build-release.yml 缓存了 sources/openwrt/dl。分支推了新代码，
+    #   dl/ 里的旧 mirror 仍被复用 → 编出来的还是旧源码，且不报任何错。
+    #   改成每次解析出真实 SHA：SHA 一变，下载缓存自然失效，必然拉到最新代码。
+    # ⚠⚠⚠ 这里踩过一个真 bug，务必保留校验 ⚠⚠⚠
+    # 旧写法只判 -z：git ls-remote 失败时输出 "fatal: unable to access ... 403"，
+    # awk '{print $1}' 得到 "fatal:" —— 非空，于是不触发兜底，
+    # PKG_SOURCE_VERSION 被写成 fatal: 这个非法值。
+    # 另一种更隐蔽的情况是退回用分支名：mirror 没 fetch 更新时，
+    # 分支引用仍指向旧 commit → 编出来就是旧源码，且不报任何错。
+    # 所以：必须拿到 40 位十六进制 SHA，拿不到就 die，绝不静默退化。
+
+    # 合法的 commit SHA：纯十六进制，7~40 位
+    is_valid_sha() {
+        case "$1" in
+            "") return 1 ;;
+            *[!0-9a-f]*) return 1 ;;    # 含非十六进制字符（"fatal:" 会命中这条）
+        esac
+        [ ${#1} -ge 7 ] && [ ${#1} -le 40 ] || return 1
+        return 0
+    }
+
+    SD_SHA=""
+    # 方式 1：git ls-remote（runner 上通常可用）
+    if command -v git >/dev/null 2>&1; then
+        SD_SHA=$(git ls-remote "https://github.com/${SMARTDNS_REPO}.git" \
+                 "refs/heads/${SMARTDNS_REF}" 2>/dev/null | awk '{print $1}')
+    fi
+    # 方式 2：GitHub API 兜底（git 走 https 被拦时这条路仍能通）
+    if ! is_valid_sha "$SD_SHA" && command -v curl >/dev/null 2>&1; then
+        SD_SHA=$(curl -fsSL --max-time 60 \
+                 "https://api.github.com/repos/${SMARTDNS_REPO}/commits/${SMARTDNS_REF}" \
+                 2>/dev/null | tr ',' '\n' | grep -m1 '"sha"' \
+                 | sed 's/.*"sha" *: *"\([0-9a-f]*\)".*/\1/')
+    fi
+    if ! is_valid_sha "$SD_SHA"; then
+        die "拿不到 ${SMARTDNS_REPO}@${SMARTDNS_REF} 的 commit SHA（git ls-remote 和 GitHub API 都失败）。
+      不能退回用分支名：dl/ 里的旧 git mirror 不会自动 fetch，分支引用会停在旧 commit，
+      结果就是编出旧源码且一声不响 —— 这正是之前白编几次的原因。
+      请检查 runner 网络，或把 SMARTDNS_REF 直接写成 40 位 SHA。"
+    fi
+
+    # --- 防缓存 2：直接删掉 dl/ 里 smartdns 的旧 mirror ---
+    rm -rf ./dl/smartdns*.git ./dl/smartdns-*.tar* 2>/dev/null || true
+
     # PKG_LICENSE_FILES 之后插入 git 协议四行
-    awk -v repo="$SMARTDNS_REPO" -v ref="$SMARTDNS_REF" '
+    awk -v repo="$SMARTDNS_REPO" -v sha="$SD_SHA" '
       { print }
       /^PKG_LICENSE_FILES:=/ && !done {
         print ""
-        print "# git 协议：直接跟分支，永远拿到分支 HEAD，不受 tag/tarball 命名影响"
+        print "# git 协议：SHA 由 diy-part.sh 每次解析得出，避免 dl/ 缓存导致源码不更新"
         print "PKG_SOURCE_PROTO:=git"
         print "PKG_SOURCE_URL:=https://github.com/" repo ".git"
-        print "PKG_SOURCE_VERSION:=" ref
+        print "PKG_SOURCE_VERSION:=" sha
         print "PKG_MIRROR_HASH:=skip"
         done=1
       }' "$SD_MK" > "$SD_MK.new" && mv "$SD_MK.new" "$SD_MK"
@@ -397,7 +485,7 @@ if [ "$DIY_SMARTDNS" = 1 ]; then
     # --- 改造 3：aarch64 不需要 i386 的 libatomic，去掉避免误加依赖 ---
     sed -i 's|^  DEPENDS:=+i386:libatomic +libopenssl|  DEPENDS:=+libopenssl|' "$SD_MK"
 
-    info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF}（git 协议，基于 ImmortalWrt Makefile）"
+    info "smartdns 源码 -> ${SMARTDNS_REPO}@${SMARTDNS_REF} = ${SD_SHA}（git 协议，基于 ImmortalWrt Makefile）"
     grep -E '^(PKG_SOURCE_PROTO|PKG_SOURCE_URL|PKG_SOURCE_VERSION|PKG_MIRROR_HASH):=' "$SD_MK" | sed 's/^/    /'
     force_pkg smartdns luci-app-smartdns
 
