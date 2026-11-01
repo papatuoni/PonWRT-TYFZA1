@@ -116,7 +116,7 @@ jobs:
               echo "### 本版包含"
               echo
               echo "- 默认 LAN IP：192.168.2.1"
-              [ "$DIY_SMARTDNS" = 1 ] && echo "- smartdns：papatuoni/smartdns @ custom-48.4-dulwan"
+              [ "$DIY_SMARTDNS" = 1 ] && echo "- smartdns：papatuoni/smartdns @ custom-48.4"
               echo "- OpenClash：vernesong/OpenClash"
               echo "- TurboACC：BBR + flow offload + fullcone（不带 SFE）"
               [ "$DIY_DDNS" = 1 ] && echo "- 动态 DNS：ddns-scripts + luci-app-ddns（Cloudflare 扩展）"
