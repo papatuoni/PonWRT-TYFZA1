@@ -24,7 +24,7 @@
 #  开关（在 workflow 里用 env 覆盖，或本地 export）：
 #    DIY_TURBOACC=1  装载 chenmozhijin/turboacc（会替换 firewall4/nftables/libnftnl）
 #    DIY_OPENCLASH=1 装载 vernesong/OpenClash
-#    DIY_SMARTDNS=1  把 smartdns 源码换成 papatuoni/smartdns 的 custom-48.4-dulwan
+#    DIY_SMARTDNS=1  把 smartdns 源码换成 papatuoni/smartdns 的 custom-48.4
 #    DIY_DDNS=1      装载 ddns-scripts + luci-app-ddns（官方 feeds）
 #    DIY_WIRELESS=1  保留无线（默认开，见第 2-2 步说明）
 #    DIY_LAN_IP=192.168.2.1
@@ -62,7 +62,7 @@ DIY_SMARTDNS_UI="${DIY_SMARTDNS_UI:-0}"
 
 # 你的 smartdns 分支：改这里就能换源码，不用动 workflow
 SMARTDNS_REPO="${SMARTDNS_REPO:-papatuoni/smartdns}"
-SMARTDNS_REF="${SMARTDNS_REF:-custom-48.4-dulwan}"
+SMARTDNS_REF="${SMARTDNS_REF:-custom-48.4}"
 
 # ImmortalWrt 源（smartdns 的 Makefile / LuCI 界面从这里取）
 # smartdns 本体用的是官方 feeds 的目录，但 Makefile 换成 ImmortalWrt 那份
