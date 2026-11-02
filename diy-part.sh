@@ -62,7 +62,7 @@ DIY_SMARTDNS_UI="${DIY_SMARTDNS_UI:-0}"
 
 # 你的 smartdns 分支：改这里就能换源码，不用动 workflow
 SMARTDNS_REPO="${SMARTDNS_REPO:-papatuoni/smartdns}"
-SMARTDNS_REF="${SMARTDNS_REF:-custom-48.4-dulwan}"
+SMARTDNS_REF="${SMARTDNS_REF:-custom-48.4-dulwandiy}"
 
 # ImmortalWrt 源（smartdns 的 Makefile / LuCI 界面从这里取）
 # smartdns 本体用的是官方 feeds 的目录，但 Makefile 换成 ImmortalWrt 那份
