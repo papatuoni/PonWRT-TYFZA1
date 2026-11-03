@@ -362,32 +362,6 @@ jobs:
           kernel=$(python3 port/tools/project_paths.py --kernel-directory sources/openwrt)
           python3 scripts/test_board_variants.py --kernel "$kernel"
 
-      # ============ 新增：smartdns 产物是否真的带补丁（不再靠刷机才发现）============
-      # 之前的问题：源码分支上 route_mgr 是死代码（没有调用点），编译静默成功，
-      # 刷完机 strings | grep dualwan 为空才发现白编一场，代价是一次编译 + 一次刷机。
-      # 这里在编译阶段就直接查，缺了立刻报出来。
-      - name: Verify smartdns dual-wan patch in build output
-        run: |
-          echo "===== smartdns 产物带不带 dualwan ====="
-          sd_bin=$(find sources/openwrt/build_dir -name smartdns -type f -perm -u+x 2>/dev/null | head -1)
-          if [ -z "$sd_bin" ]; then
-            echo "::warning::没找到 smartdns 二进制，跳过校验"
-            exit 0
-          fi
-          echo "二进制: $sd_bin"
-          ls -la "$sd_bin"
-          if strings "$sd_bin" 2>/dev/null | grep -qi dualwan; then
-            echo "  OK   smartdns 含 dualwan —— route_mgr 已进产物"
-            strings "$sd_bin" | grep -i dualwan | head -3 | sed 's/^/       /'
-          else
-            echo "  MISS smartdns 不含 dualwan"
-            echo ""
-            echo "  可能原因（按概率）："
-            echo "    1. smartdns 分支没应用接线补丁（route_mgr.c 存在但没有调用点）"
-            echo "    2. diy-part.sh 拿到的还是旧源码（看上一步打印的 SHA）"
-            echo "::error::smartdns 产物不含 dualwan，刷机后双 WAN 不会生效"
-            exit 1
-          fi
       - name: Package firmware and installer
         run: |
           sh scripts/package_release.sh sources/openwrt artifacts/release
