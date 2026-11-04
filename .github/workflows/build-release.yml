@@ -413,3 +413,54 @@ jobs:
           gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
             --json tagName,isDraft,isPrerelease,url \
             --jq '"tag=\(.tagName) draft=\(.isDraft) prerelease=\(.isPrerelease)\nURL: \(.url)"'
+
+      - name: Resolve smartdns stall frames
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          OW="$GITHUB_WORKSPACE/sources/openwrt"
+          [ -d "$OW" ] || OW="$GITHUB_WORKSPACE"
+          cd "$OW" || exit 0
+
+          A2L=$(find staging_dir/toolchain-* -type f -name 'aarch64-openwrt-linux-musl-addr2line' 2>/dev/null | head -1)
+          NM=$(find staging_dir/toolchain-* -type f -name 'aarch64-openwrt-linux-musl-nm' 2>/dev/null | head -1)
+          LIBC=$(find build_dir/target-* -path '*toolchain/.pkgdir/libc/lib/libc.so' 2>/dev/null | head -1)
+          [ -n "$LIBC" ] || LIBC=$(find build_dir/toolchain-* -path '*musl-*/lib/libc.so' 2>/dev/null | head -1)
+          SD=$(find build_dir/target-* -path '*smartdns-48.4/src/smartdns' -type f 2>/dev/null | head -1)
+
+          S="$GITHUB_STEP_SUMMARY"
+          echo "### smartdns 卡顿栈帧解析" >> "$S"; echo "" >> "$S"
+          echo "| 项 | 值 |" >> "$S"; echo "|---|---|" >> "$S"
+          echo "| addr2line | ${A2L:-未找到} |" >> "$S"
+          echo "| libc(带符号) | ${LIBC:-未找到} |" >> "$S"
+          echo "| smartdns(带符号) | ${SD:-未找到} |" >> "$S"
+
+          if [ -n "$A2L" ] && [ -n "$LIBC" ]; then
+            echo "" >> "$S"; echo "#### libc（0x64aa0 在第一行）" >> "$S"; echo '```' >> "$S"
+            for O in 0x64aa0 0x62a98 0x61dbc 0x3b2a8 0x61ad8 0x61bd0 \
+                     0x63a78 0x61d8c 0x62ed4 0x20df4 0x68350 0x68870 0x6bbcc; do
+              printf '%-10s ' "$O" >> "$S"
+              "$A2L" -Cfipe "$LIBC" "$O" >> "$S" 2>&1
+            done
+            echo '```' >> "$S"
+          fi
+
+          if [ -n "$A2L" ] && [ -n "$SD" ]; then
+            BASE=$(readelf -lW "$SD" 2>/dev/null | awk '/LOAD/{print $3; exit}')
+            BASE=${BASE:-0x400000}
+            echo "" >> "$S"; echo "#### smartdns（基址 $BASE）" >> "$S"; echo '```' >> "$S"
+            for O in 0x68c72 0x5abc0; do
+              H=$(printf '0x%x' $(( BASE + O )))
+              printf '%-10s -> %s  ' "$O" "$H" >> "$S"
+              "$A2L" -Cfipe "$SD" "$H" >> "$S" 2>&1
+            done
+            echo '```' >> "$S"
+          fi
+
+          if [ -n "$NM" ] && [ -n "$LIBC" ]; then
+            echo "" >> "$S"; echo "#### 0x64aa0 最近符号" >> "$S"; echo '```' >> "$S"
+            "$NM" -D -n --defined-only "$LIBC" 2>/dev/null \
+              | awk '$1<="0000000000064aa0"{last=$0} END{print last}' >> "$S"
+            echo '```' >> "$S"
+          fi
