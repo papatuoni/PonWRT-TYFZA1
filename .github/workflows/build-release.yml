@@ -414,53 +414,194 @@ jobs:
             --json tagName,isDraft,isPrerelease,url \
             --jq '"tag=\(.tagName) draft=\(.isDraft) prerelease=\(.isPrerelease)\nURL: \(.url)"'
 
-      - name: Resolve smartdns stall frames
+      - name: Verify route_cache (cloud build)
         if: always()
         shell: bash
         run: |
           set -u
           OW="$GITHUB_WORKSPACE/sources/openwrt"
           [ -d "$OW" ] || OW="$GITHUB_WORKSPACE"
-          cd "$OW" || exit 0
-
-          A2L=$(find staging_dir/toolchain-* -type f -name 'aarch64-openwrt-linux-musl-addr2line' 2>/dev/null | head -1)
-          NM=$(find staging_dir/toolchain-* -type f -name 'aarch64-openwrt-linux-musl-nm' 2>/dev/null | head -1)
-          LIBC=$(find build_dir/target-* -path '*toolchain/.pkgdir/libc/lib/libc.so' 2>/dev/null | head -1)
-          [ -n "$LIBC" ] || LIBC=$(find build_dir/toolchain-* -path '*musl-*/lib/libc.so' 2>/dev/null | head -1)
-          SD=$(find build_dir/target-* -path '*smartdns-48.4/src/smartdns' -type f 2>/dev/null | head -1)
-
+          SRC=$(find "$OW/build_dir/target-"* -path '*smartdns-48.4/src/dns_server/route_cache.c' -type f 2>/dev/null | head -1)
           S="$GITHUB_STEP_SUMMARY"
-          echo "### smartdns 卡顿栈帧解析" >> "$S"; echo "" >> "$S"
-          echo "| 项 | 值 |" >> "$S"; echo "|---|---|" >> "$S"
-          echo "| addr2line | ${A2L:-未找到} |" >> "$S"
-          echo "| libc(带符号) | ${LIBC:-未找到} |" >> "$S"
-          echo "| smartdns(带符号) | ${SD:-未找到} |" >> "$S"
+          echo "### route_cache 云编译验证" >> "$S"; echo "" >> "$S"
+          if [ -z "$SRC" ]; then
+            echo "::warning::找不到 route_cache.c，跳过（smartdns 未编译）"
+            echo "route_cache.c 未找到，跳过" >> "$S"; exit 0
+          fi
+          D=$(dirname "$SRC")
+          echo "源码: \`$SRC\`" >> "$S"
 
-          if [ -n "$A2L" ] && [ -n "$LIBC" ]; then
-            echo "" >> "$S"; echo "#### libc（0x64aa0 在第一行）" >> "$S"; echo '```' >> "$S"
-            for O in 0x64aa0 0x62a98 0x61dbc 0x3b2a8 0x61ad8 0x61bd0 \
-                     0x63a78 0x61d8c 0x62ed4 0x20df4 0x68350 0x68870 0x6bbcc; do
-              printf '%-10s ' "$O" >> "$S"
-              "$A2L" -Cfipe "$LIBC" "$O" >> "$S" 2>&1
-            done
-            echo '```' >> "$S"
+          # ---- 5. 真实固件 CFLAGS 编译 ----
+          XCC=$(find "$OW/staging_dir/toolchain-"* -type f -name 'aarch64-openwrt-linux-musl-gcc' 2>/dev/null | head -1)
+          XNM=$(find "$OW/staging_dir/toolchain-"* -type f -name 'aarch64-openwrt-linux-musl-nm' 2>/dev/null | head -1)
+          if [ -n "$XCC" ]; then
+            CF="-Os -pipe -mcpu=cortex-a55 -fno-caller-saves -fno-plt -fhonour-copts -Wformat -Werror=format-security -fstack-protector -D_FORTIFY_SOURCE=1"
+            if "$XCC" $CF -I"$D" -c "$SRC" -o /tmp/rc_real.o 2>/tmp/rc_cc.log; then
+              echo "- [PASS] 真实交叉工具链严格编译" >> "$S"
+              if [ -n "$XNM" ]; then
+                NS=$("$XNM" /tmp/rc_real.o 2>/dev/null | grep -c 'route_cache_')
+                echo "  - 导出 route_cache_* 符号数: $NS" >> "$S"
+              fi
+            else
+              echo "- [FAIL] 真实交叉编译失败" >> "$S"; echo '```' >> "$S"
+              cat /tmp/rc_cc.log >> "$S"; echo '```' >> "$S"; exit 1
+            fi
+          else
+            echo "- [SKIP] 未找到交叉 gcc（toolchain 未编出）" >> "$S"
           fi
 
-          if [ -n "$A2L" ] && [ -n "$SD" ]; then
-            BASE=$(readelf -lW "$SD" 2>/dev/null | awk '/LOAD/{print $3; exit}')
-            BASE=${BASE:-0x400000}
-            echo "" >> "$S"; echo "#### smartdns（基址 $BASE）" >> "$S"; echo '```' >> "$S"
-            for O in 0x68c72 0x5abc0; do
-              H=$(printf '0x%x' $(( BASE + O )))
-              printf '%-10s -> %s  ' "$O" "$H" >> "$S"
-              "$A2L" -Cfipe "$SD" "$H" >> "$S" 2>&1
-            done
-            echo '```' >> "$S"
+          # ---- 自包含测试源（不依赖仓库新增文件） ----
+          T=$(mktemp -d)
+          cat > "$T/v.c" <<'CEOF'
+          #include "route_cache.h"
+          #include <pthread.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <time.h>
+          #if defined(__GNUC__)
+          #pragma GCC diagnostic ignored "-Wunused-function"
+          #endif
+          extern char route_cache_test_log[ROUTE_CACHE_TEST_LOG_MAX][ROUTE_CACHE_TEST_CMD_LEN];
+          extern int route_cache_test_n;
+          extern const char *route_cache_test_proc_route;
+          static int F = 0, P = 0;
+          #define CK(c, ...) do { if (!(c)) { printf("  [FAIL] "); printf(__VA_ARGS__); printf(" @%d\n", __LINE__); F++; } else P++; } while (0)
+          static void scp(char *d, const char *s, size_t n) { if (n) { strncpy(d, s, n - 1); d[n - 1] = 0; } }
+          static struct route_cache_key mk(const char *d) { struct route_cache_key k; memset(&k, 0, sizeof(k)); k.group = "-"; k.domain = d; k.qtype = 1; return k; }
+          static void set4(struct route_cache_addr *a, const char *ifn, unsigned char x, unsigned char y, unsigned char z, unsigned char w) {
+            memset(a, 0, sizeof(*a)); a->family = 2; a->ip[0] = x; a->ip[1] = y; a->ip[2] = z; a->ip[3] = w; scp(a->ifname, ifn, sizeof(a->ifname));
+          }
+          static int has(const char *s) { int i; for (i = 0; i < route_cache_test_n; i++) if (strstr(route_cache_test_log[i], s)) return 1; return 0; }
+          static void fresh(void) { route_cache_exit(); route_cache_test_reset(); route_cache_init(); route_cache_test_reset(); }
+
+          static void t_basic(void) {
+            struct route_cache_key a = mk("a.test"); struct route_cache_addr v[4]; int n0;
+            fresh(); set4(&v[0], "lan2", 1, 2, 3, 4);
+            route_cache_on_insert(&a, v, 1, 300);
+            CK(route_cache_test_n == 1 && has("ADD 1.2.3.4 dev lan2"), "first ADD n=%d", route_cache_test_n);
+            n0 = route_cache_test_n; route_cache_on_hit(&a, 300);
+            CK(route_cache_test_n == n0, "hit must be 0 commands");
+            route_cache_on_del(&a); route_cache_on_insert(&a, v, 1, 300);
+            CK(route_cache_test_n == n0, "DEL->SET jitter must be 0 commands");
+            CK(route_cache_test_pending_num() == 0, "pending chain must be empty");
+          }
+          static void t_first_wins(void) {
+            struct route_cache_key a = mk("a.test"), b = mk("b.test"); struct route_cache_addr v[4]; int n0;
+            fresh(); set4(&v[0], "lan2", 1, 2, 3, 4); route_cache_on_insert(&a, v, 1, 300); n0 = route_cache_test_n;
+            set4(&v[0], "wan2", 1, 2, 3, 4); route_cache_on_insert(&a, v, 1, 300);
+            CK(route_cache_test_n == n0 + 1 && has("ADD 1.2.3.4 dev wan2"), "owner self-migration must REPLACE n=%d", route_cache_test_n);
+            n0 = route_cache_test_n;
+            set4(&v[0], "lan3", 1, 2, 3, 4); route_cache_on_insert(&b, v, 1, 300);
+            CK(route_cache_test_n == n0, "second owner must NOT replace egress");
+            set4(&v[0], "lan4", 1, 2, 3, 4); route_cache_on_insert(&a, v, 1, 300);
+            CK(route_cache_test_n == n0, "with 2 owners first-wins must hold");
+          }
+          static void t_lan(void) {
+            struct route_cache_key a = mk("lan.test"); struct route_cache_addr v[4];
+            fresh(); set4(&v[0], "lan2", 10, 0, 0, 5); set4(&v[1], "lan2", 192, 168, 3, 9);
+            route_cache_on_insert(&a, v, 2, 300);
+            CK(route_cache_test_n == 2 && has("ADD 10.0.0.5") && has("ADD 192.168.3.9"), "RFC1918 must NOT be filtered n=%d", route_cache_test_n);
+          }
+          static void t_sat(void) {
+            struct route_cache_key a = mk("a.test"), b = mk("b.test"), c = mk("c.test"); struct route_cache_addr v[4]; int n0;
+            fresh(); set4(&v[0], "lan2", 1, 1, 1, 1); route_cache_on_insert(&a, v, 1, 300);
+            set4(&v[0], "lan2", 2, 2, 2, 2); route_cache_on_insert(&b, v, 1, 300); n0 = route_cache_test_n;
+            set4(&v[0], "lan2", 3, 3, 3, 3); route_cache_on_insert(&c, v, 1, 300);
+            CK(route_cache_test_n == n0, "saturated insert must not DEL/ADD, got %d", route_cache_test_n - n0);
+            CK(!has("DEL 1.1.1.1") && !has("DEL 2.2.2.2"), "live /32 must not be evicted");
+            route_cache_on_hit(&a, 300); CK(route_cache_test_n == n0, "hit after saturation 0 commands");
+          }
+          static void t_flush(void) {
+            struct route_cache_key k; struct route_cache_addr v[4]; char d[64]; int i, n0;
+            fresh();
+            for (i = 0; i < 100; i++) { snprintf(d, sizeof(d), "d%d.test", i); k = mk(d); set4(&v[0], "lan2", 11, (unsigned char)(i / 256), (unsigned char)(i % 256), 7); route_cache_on_insert(&k, v, 1, 300); }
+            n0 = route_cache_test_n; CK(n0 == 100, "expected 100 ADDs got %d", n0);
+            for (i = 0; i < 100; i++) { snprintf(d, sizeof(d), "d%d.test", i); k = mk(d); route_cache_on_del(&k); }
+            CK(route_cache_test_n == n0, "on_del must emit 0 commands, got %d", route_cache_test_n - n0);
+            CK(route_cache_test_pending_num() == 100, "pending chain should hold 100 got %d", route_cache_test_pending_num());
+            k = mk("new.test"); set4(&v[0], "lan2", 9, 9, 9, 9); route_cache_on_insert(&k, v, 1, 300);
+            CK(has("DEL 11.0.0.7"), "deferred DEL must eventually happen");
+          }
+          static void *worker(void *arg) {
+            long id = (long)arg; int i; unsigned int st = (unsigned int)time(NULL) ^ (unsigned int)(id + 1);
+            for (i = 0; i < 3000; i++) {
+              struct route_cache_key k; struct route_cache_addr v[2]; char d[32];
+              int dn = (int)(rand_r(&st) % 8), ip = (int)(rand_r(&st) % 32), op = (int)(rand_r(&st) % 4);
+              snprintf(d, sizeof(d), "w%d.test", dn); k = mk(d);
+              set4(&v[0], (op & 1) ? "lan2" : "wan2", 100, (unsigned char)dn, (unsigned char)ip, 1);
+              if (op < 2) route_cache_on_insert(&k, v, 1, 300); else if (op == 2) route_cache_on_hit(&k, 300); else route_cache_on_del(&k);
+            }
+            return NULL;
+          }
+          static void t_concurrent(void) {
+            pthread_t th[4]; long i;
+            fresh();
+            for (i = 0; i < 4; i++) pthread_create(&th[i], NULL, worker, (void *)i);
+            for (i = 0; i < 4; i++) pthread_join(th[i], NULL);
+            CK(route_cache_test_pending_num() <= route_cache_test_ip_num(), "pending=%d > ip=%d chain corrupted", route_cache_test_pending_num(), route_cache_test_ip_num());
+            route_cache_exit();
+            CK(route_cache_test_pending_num() == 0, "exit must clear pending got %d", route_cache_test_pending_num());
+            CK(route_cache_test_ip_num() == 0, "exit must free all IPs got %d", route_cache_test_ip_num());
+          }
+          int main(void) {
+            FILE *f = fopen("/tmp/rc_route", "w");
+            if (f) { fprintf(f, "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\nlan2\t00000000\t0103A8C0\t0003\t0\t0\t20\t00000000\n"); fclose(f); route_cache_test_proc_route = "/tmp/rc_route"; }
+          #ifdef SATURATE_TEST
+            t_sat();
+          #else
+            t_basic(); t_first_wins(); t_lan(); t_flush(); t_concurrent();
+            if (route_cache_test_owner_tail() != 0) { printf("  [FAIL] owner->addrs tail dirty=%d\n", route_cache_test_owner_tail()); F++; } else P++;
+          #endif
+            printf("PASS=%d FAIL=%d\n", P, F);
+            return F ? 1 : 0;
+          }
+          CEOF
+          cp "$D/route_cache.h" "$T/route_cache.h"
+
+          HC="-O2 -Wall -Wextra -Werror -DROUTE_CACHE_UNIT_TEST -DHAS_NEW_HOOKS -I$T"
+          echo "" >> "$S"; echo "#### 主机侧验证" >> "$S"; echo '```' >> "$S"
+
+          # ---- 1. 容量饱和（MAX_IP=2） ----
+          if gcc $HC -DROUTE_CACHE_MAX_IP=2 -DSATURATE_TEST "$SRC" "$T/v.c" -lpthread -o "$T/vsat" 2>"$T/e1" && "$T/vsat" >> "$S" 2>&1; then
+            echo "- [PASS] 容量饱和：活跃 /32 不被淘汰" >> "$S"
+          else
+            echo "- [FAIL] 容量饱和"; cat "$T/e1" >> "$S"; F=1
           fi
 
-          if [ -n "$NM" ] && [ -n "$LIBC" ]; then
-            echo "" >> "$S"; echo "#### 0x64aa0 最近符号" >> "$S"; echo '```' >> "$S"
-            "$NM" -D -n --defined-only "$LIBC" 2>/dev/null \
-              | awk '$1<="0000000000064aa0"{last=$0} END{print last}' >> "$S"
-            echo '```' >> "$S"
+          # ---- 4. 栈毒化 A/B（需要 gcc >= 12） ----
+          if gcc -ftrivial-auto-var-init=pattern -x c -c /dev/null -o /dev/null 2>/dev/null; then
+            sed '/memset(nv, 0, sizeof(nv));/d; /memset(old, 0, sizeof(old));/d' "$SRC" > "$T/bad.c"
+            if gcc $HC -ftrivial-auto-var-init=pattern "$SRC" "$T/v.c" -lpthread -o "$T/vgood" 2>"$T/e2" && "$T/vgood" >> "$S" 2>&1; then
+              echo "- [PASS] 栈毒化：nv/old memset 生效，owner->addrs 尾部干净" >> "$S"
+            else
+              echo "- [FAIL] 栈毒化（好版）"; cat "$T/e2" >> "$S"; F=1
+            fi
+            if gcc $HC -ftrivial-auto-var-init=pattern "$T/bad.c" "$T/v.c" -lpthread -o "$T/vbad" 2>/dev/null && "$T/vbad" > "$T/bad.out" 2>&1; then
+              echo "- [WARN] 去掉 memset 的坏版也通过了，毒化可能未生效（检查输出）" >> "$S"
+            else
+              echo "- [PASS] 毒化 A/B 有效：去掉 memset 的坏版被检出" >> "$S"
+            fi
+          else
+            echo "- [SKIP] host gcc 不支持 -ftrivial-auto-var-init=pattern（memset 由代码审查保证）" >> "$S"
           fi
+
+          # ---- 6. 批量 on_del 零命令 + 并发（好版已编出时复跑一次） ----
+          if [ -x "$T/vgood" ]; then
+            "$T/vgood" >> "$S" 2>&1 || F=1
+          fi
+
+          # ---- ASan 并发 ----
+          if gcc -O1 -g -DROUTE_CACHE_UNIT_TEST -DHAS_NEW_HOOKS -I"$T" -fsanitize=address -fno-omit-frame-pointer "$SRC" "$T/v.c" -lpthread -o "$T/vasan" 2>"$T/e3"; then
+            if ASAN_OPTIONS=detect_leaks=1 "$T/vasan" >> "$S" 2>&1; then
+              echo "- [PASS] ASan 4 线程 × 3000 次交错无内存错误" >> "$S"
+            else
+              echo "- [FAIL] ASan"; F=1
+            fi
+          else
+            echo "- [SKIP] ASan 不可用"; cat "$T/e3" >> "$S"
+          fi
+          echo '```' >> "$S"
+          echo "" >> "$S"
+          if [ "${F:-0}" = "1" ]; then echo "::error::route_cache 验证未全过，看上面输出"; exit 1; fi
+          echo "**全部通过**" >> "$S"
